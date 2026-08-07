@@ -1,0 +1,37 @@
+name: paper-repro CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Validate Python and shell syntax
+        run: |
+          python -m py_compile scripts/reproctl.py
+          bash -n bootstrap.sh scripts/uninstall.sh tests/smoke_test.sh
+      - name: Validate JSON schemas and examples
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          for path in [*Path('schemas').glob('*.json'), *Path('configs').glob('*.json')]:
+              json.loads(path.read_text(encoding='utf-8'))
+              print(f'OK {path}')
+          PY
+      - name: Run isolated smoke test
+        env:
+          PAPER_REPRO_SELF_TEST: '1'
+        run: bash tests/smoke_test.sh

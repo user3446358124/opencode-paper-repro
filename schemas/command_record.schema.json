@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Paper Reproduction Command Record",
+  "type": "object",
+  "required": ["record_type", "id", "stage", "status", "log"],
+  "properties": {
+    "record_type": {"enum": ["start", "finish"]},
+    "id": {"type": "string"},
+    "stage": {"type": "string"},
+    "command": {"type": "string"},
+    "cwd": {"type": "string"},
+    "started_at": {"type": "string", "format": "date-time"},
+    "finished_at": {"type": "string", "format": "date-time"},
+    "status": {"enum": ["running", "succeeded", "failed", "timeout"]},
+    "exit_code": {"type": "integer"},
+    "elapsed_seconds": {"type": "integer", "minimum": 0},
+    "timeout_seconds": {"type": "integer", "minimum": 1},
+    "estimate_seconds": {"type": ["integer", "null"], "minimum": 0},
+    "log": {"type": "string"}
+  }
+}

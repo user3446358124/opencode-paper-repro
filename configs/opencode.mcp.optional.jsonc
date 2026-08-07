@@ -1,0 +1,6 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  // 兼容旧路径。v0.6.0 起请使用 paper-repro mcp install-basic/status/enable/disable。
+  // 实际配置由 ~/.config/paper-repro/mcp-settings.json 生成到 opencode.mcp.runtime.json。
+  "mcp": {}
+}

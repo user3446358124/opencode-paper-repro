@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Paper Reproduction Workspace Configuration",
+  "type": "object",
+  "required": ["schema_version", "workspace", "execution_env"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "workspace": {"type": "string"},
+    "execution_env": {
+      "type": "object",
+      "required": ["name", "prefix", "python", "mode", "configured_at"],
+      "properties": {
+        "name": {"type": "string"},
+        "prefix": {"type": "string"},
+        "python": {"type": "string"},
+        "mode": {"const": "conda-prefix"},
+        "source": {"type": "string"},
+        "configured_at": {"type": "string", "format": "date-time"}
+      }
+    },
+    "updated_at": {"type": "string", "format": "date-time"}
+  }
+}

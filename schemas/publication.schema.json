@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Paper Repro GitHub Publication Record",
+  "type": "object",
+  "required": [
+    "publication_id",
+    "system_version",
+    "status"
+  ],
+  "properties": {
+    "publication_id": {
+      "type": "string",
+      "pattern": "^PUB-"
+    },
+    "system_version": {
+      "type": "string"
+    },
+    "improvement_id": {
+      "type": "string"
+    },
+    "target": {
+      "type": "string"
+    },
+    "visibility": {
+      "enum": [
+        "",
+        "public",
+        "private",
+        "internal"
+      ]
+    },
+    "status": {
+      "enum": [
+        "queued",
+        "awaiting-configuration",
+        "prepared",
+        "scanned",
+        "blocked",
+        "approved",
+        "published",
+        "published-pr",
+        "no-changes",
+        "aborted",
+        "failed"
+      ]
+    },
+    "manifest_sha256": {
+      "type": "string"
+    },
+    "repository_url": {
+      "type": "string"
+    },
+    "pull_request_url": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": true
+}

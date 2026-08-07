@@ -1,0 +1,147 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://paper-repro.local/schemas/unified_config.schema.json",
+  "title": "paper-repro unified global configuration",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "secrets",
+    "model_routing",
+    "mcp"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "updated_at": {
+      "type": "string"
+    },
+    "secrets": {
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[A-Z][A-Z0-9_]{1,127}$"
+      },
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "model_routing": {
+      "type": "object"
+    },
+    "mcp": {
+      "type": "object"
+    },
+    "migration": {
+      "type": "object"
+    },
+    "decision_policy": {
+      "type": "object"
+    },
+    "decision_preferences": {
+      "type": "object"
+    },
+    "self_improvement": {
+      "type": "object"
+    },
+    "github_publish": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "mode": {
+          "enum": [
+            "off",
+            "review"
+          ]
+        },
+        "host": {
+          "type": "string"
+        },
+        "owner": {
+          "type": "string"
+        },
+        "repository": {
+          "type": "string"
+        },
+        "visibility": {
+          "enum": [
+            "",
+            "public",
+            "private",
+            "internal"
+          ]
+        },
+        "description": {
+          "type": "string"
+        },
+        "default_branch": {
+          "type": "string"
+        },
+        "license": {
+          "enum": [
+            "MIT",
+            "none"
+          ]
+        },
+        "copyright_holder": {
+          "type": "string"
+        },
+        "auth_method": {
+          "enum": [
+            "gh",
+            "token"
+          ]
+        },
+        "token_env": {
+          "type": "string"
+        },
+        "existing_repo_mode": {
+          "enum": [
+            "pull-request",
+            "direct"
+          ]
+        },
+        "sync_mode": {
+          "enum": [
+            "managed-mirror",
+            "preserve-extra"
+          ]
+        },
+        "after_verified": {
+          "enum": [
+            "off",
+            "notify",
+            "prepare"
+          ]
+        },
+        "require_clean_scan": {
+          "type": "boolean"
+        },
+        "require_explicit_approval": {
+          "type": "boolean"
+        },
+        "approval_ttl_seconds": {
+          "type": "integer",
+          "minimum": 60
+        },
+        "max_file_bytes": {
+          "type": "integer",
+          "minimum": 1024
+        },
+        "enable_push_protection": {
+          "type": "boolean"
+        },
+        "git_author_name": {
+          "type": "string"
+        },
+        "git_author_email": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

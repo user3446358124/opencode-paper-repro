@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Paper Reproduction Run State",
+  "type": "object",
+  "required": ["schema_version", "system_version", "run_id", "workspace", "status", "stage", "progress", "started_at", "updated_at", "pipeline", "task"],
+  "properties": {
+    "schema_version": {"const": 2},
+    "system_version": {"type": "string"},
+    "run_id": {"type": "string"},
+    "workspace": {"type": "string"},
+    "state_home": {"type": "string"},
+    "status": {"type": "string"},
+    "stage": {"type": "string"},
+    "progress": {"type": "number", "minimum": 0, "maximum": 1},
+    "message": {"type": "string"},
+    "started_at": {"type": "string", "format": "date-time"},
+    "updated_at": {"type": "string", "format": "date-time"},
+    "elapsed_seconds": {"type": "integer", "minimum": 0},
+    "eta_seconds": {"type": ["integer", "null"], "minimum": 0},
+    "control_env": {"type": ["object", "null"]},
+    "execution_env": {"type": ["object", "null"]},
+    "pipeline": {
+      "type": "object",
+      "required": ["total_steps", "current_step", "completed_steps", "remaining_steps", "steps"],
+      "properties": {
+        "total_steps": {"type": "integer", "minimum": 1},
+        "current_step": {"type": "integer", "minimum": 1},
+        "completed_steps": {"type": "integer", "minimum": 0},
+        "remaining_steps": {"type": "integer", "minimum": 0},
+        "steps": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["index", "id", "name", "status"],
+            "properties": {
+              "index": {"type": "integer", "minimum": 1},
+              "id": {"type": "string"},
+              "name": {"type": "string"},
+              "status": {"enum": ["pending", "running", "completed", "failed", "blocked"]}
+            }
+          }
+        }
+      }
+    },
+    "task": {
+      "type": "object",
+      "properties": {
+        "name": {"type": "string"},
+        "status": {"type": "string"},
+        "progress": {"type": "number", "minimum": 0, "maximum": 1},
+        "completed": {"type": ["number", "integer"]},
+        "total": {"type": ["number", "integer", "null"]},
+        "unit": {"type": "string"},
+        "speed": {"type": ["number", "null"]},
+        "eta_seconds": {"type": ["integer", "null"], "minimum": 0},
+        "message": {"type": "string"}
+      }
+    },
+    "last_gpu": {"type": "array", "items": {"type": "object"}},
+    "blockers": {"type": "array"}
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Paper Manifest",
+  "type": "object",
+  "required": ["paper", "tables", "figures", "datasets", "experiments", "ambiguities", "extraction_provenance"],
+  "properties": {
+    "paper": {"type": "object"},
+    "tables": {"type": "array", "items": {"type": "object"}},
+    "figures": {"type": "array", "items": {"type": "object"}},
+    "datasets": {"type": "array", "items": {"type": "object"}},
+    "models": {"type": "array", "items": {"type": "object"}},
+    "experiments": {"type": "array", "items": {"type": "object"}},
+    "claims": {"type": "array", "items": {"type": "object"}},
+    "ambiguities": {"type": "array", "items": {"type": "object"}},
+    "requires_vision": {"type": "array", "items": {"type": "object"}},
+    "extraction_provenance": {
+      "type": "object",
+      "required": ["vision_policy", "vision_calls", "vision_pages"],
+      "properties": {
+        "text_extractors": {"type": "array", "items": {"type": "string"}},
+        "vision_policy": {"enum": ["targeted", "on-demand", "all-pages", "off"]},
+        "vision_calls": {"type": "integer", "minimum": 0},
+        "vision_pages": {"type": "array", "items": {"type": "integer", "minimum": 1}},
+        "failed_vision_pages": {"type": "array", "items": {"type": "integer", "minimum": 1}},
+        "routes": {"type": "array", "items": {"type": "object"}}
+      }
+    }
+  }
+}

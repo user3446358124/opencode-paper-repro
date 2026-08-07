@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "secrets": {
+    "PAPER_VISION_API_KEY": "<SET_INTERACTIVELY>",
+    "GITHUB_MCP_TOKEN": "<SET_INTERACTIVELY>",
+    "HF_TOKEN": "<SET_INTERACTIVELY>",
+    "CONTEXT7_API_KEY": "<SET_INTERACTIVELY>",
+    "BRAVE_API_KEY": "<SET_INTERACTIVELY>",
+    "GITHUB_PUBLISH_TOKEN": "<SET_INTERACTIVELY>"
+  },
+  "model_routing": {
+    "policy": "native-first",
+    "native": {
+      "capability": "auto"
+    },
+    "profiles": {},
+    "routes": {
+      "vision": [],
+      "document": [],
+      "ocr": [],
+      "table": [],
+      "chart": [],
+      "formula": []
+    }
+  },
+  "mcp": {
+    "native_websearch": true,
+    "servers": {
+      "context7": {
+        "enabled": true
+      },
+      "github-readonly": {
+        "enabled": false
+      },
+      "huggingface": {
+        "enabled": false
+      },
+      "brave-search": {
+        "enabled": false
+      }
+    }
+  },
+  "decision_policy": {
+    "mode": "balanced",
+    "max_interruptions_per_stage": 2,
+    "max_interruptions_per_run": 8,
+    "batch_related_decisions": true,
+    "use_remembered_preferences": true,
+    "auto_apply_safe_default_when_budget_exhausted": true,
+    "thresholds": {
+      "large_download_gb": 20,
+      "long_task_hours": 4,
+      "paid_api_cny": 20,
+      "source_patch_files": 5
+    }
+  },
+  "decision_preferences": {},
+  "self_improvement": {
+    "mode": "guarded",
+    "auto_enqueue_system_issues": true,
+    "auto_apply_safe_patches": true,
+    "max_attempts": 2,
+    "max_changed_files": 12,
+    "auto_apply_max_files": 3,
+    "require_smoke_tests": true
+  },
+  "github_publish": {
+    "mode": "review",
+    "host": "github.com",
+    "owner": "",
+    "repository": "",
+    "visibility": "",
+    "description": "OpenCode-based auditable paper reproduction automation",
+    "license": "MIT",
+    "copyright_holder": "",
+    "auth_method": "gh",
+    "token_env": "GITHUB_PUBLISH_TOKEN",
+    "existing_repo_mode": "pull-request",
+    "after_verified": "notify",
+    "require_clean_scan": true,
+    "require_explicit_approval": true,
+    "sync_mode": "managed-mirror"
+  }
+}

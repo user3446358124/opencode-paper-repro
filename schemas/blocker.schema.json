@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Project Reproduction Blocker",
+  "type": "object",
+  "required": ["scope", "blocker_id", "title", "details", "stage", "status"],
+  "properties": {
+    "scope": {"const": "project"},
+    "blocker_id": {"type": "string"},
+    "title": {"type": "string"},
+    "details": {"type": "string"},
+    "stage": {"type": "string"},
+    "status": {"enum": ["open", "resolved"]},
+    "severity": {"enum": ["info", "warning", "error", "critical"]}
+  }
+}

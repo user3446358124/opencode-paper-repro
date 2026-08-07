@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Paper-Repro System Function Issue Event",
+  "type": "object",
+  "required": ["action", "scope", "issue_id", "ts"],
+  "properties": {
+    "action": {"enum": ["opened", "resolved"]},
+    "scope": {"const": "system"},
+    "issue_id": {"type": "string"},
+    "ts": {"type": "string", "format": "date-time"},
+    "system_version": {"type": "string"},
+    "status": {"enum": ["open", "resolved"]},
+    "severity": {"enum": ["info", "warning", "error", "critical"]},
+    "component": {"type": "string"},
+    "category": {"type": "string"},
+    "stage": {"type": "string"},
+    "title": {"type": "string"},
+    "details": {"type": "string"},
+    "expected": {"type": "string"},
+    "optimization": {"type": "string"},
+    "command": {"type": "string"},
+    "log": {"type": "string"},
+    "workspace": {"type": "string"},
+    "run_id": {"type": "string"},
+    "resolution": {"type": "string"}
+  }
+}

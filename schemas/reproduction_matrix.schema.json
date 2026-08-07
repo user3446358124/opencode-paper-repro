@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Reproduction Matrix",
+  "type": "object",
+  "required": ["items"],
+  "properties": {
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["paper_item", "status", "confidence", "evidence"],
+        "properties": {
+          "paper_item": {"type": "string"},
+          "table": {"type": ["string", "null"]},
+          "row": {"type": ["string", "null"]},
+          "column": {"type": ["string", "null"]},
+          "metric": {"type": ["string", "null"]},
+          "paper_value": {},
+          "code_entrypoint": {"type": ["string", "null"]},
+          "config": {"type": ["string", "null"]},
+          "required_assets": {"type": "array"},
+          "expected_output": {"type": ["string", "null"]},
+          "status": {"enum": ["exact", "partial", "not_implemented", "blocked", "ambiguous"]},
+          "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+          "evidence": {"type": "array"},
+          "blockers": {"type": "array"}
+        }
+      }
+    }
+  }
+}

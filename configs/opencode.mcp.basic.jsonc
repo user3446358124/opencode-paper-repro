@@ -1,0 +1,43 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  // 该文件由 paper-repro mcp sync 生成实际运行版；不要在这里保存 API Key。
+  // 默认：OpenCode 内建 websearch + Context7。GitHub/Hugging Face/Brave 按需启用。
+  "mcp": {
+    "context7": {
+      "type": "remote",
+      "url": "https://mcp.context7.com/mcp",
+      "enabled": true,
+      "timeout": 15000
+    },
+    "github-readonly": {
+      "type": "remote",
+      "url": "https://api.githubcopilot.com/mcp/readonly",
+      "enabled": false,
+      "headers": {
+        "Authorization": "Bearer {env:GITHUB_MCP_TOKEN}",
+        "X-MCP-Readonly": "true",
+        "X-MCP-Toolsets": "repos,issues,pull_requests"
+      },
+      "timeout": 20000
+    },
+    "huggingface": {
+      "type": "remote",
+      "url": "https://huggingface.co/mcp?no_image_content=true",
+      "enabled": false,
+      "headers": {
+        "Authorization": "Bearer {env:HF_TOKEN}"
+      },
+      "timeout": 20000
+    },
+    "brave-search": {
+      "type": "local",
+      "command": ["npx", "-y", "@brave/brave-search-mcp-server", "--transport", "stdio"],
+      "enabled": false,
+      "environment": {
+        "BRAVE_API_KEY": "{env:BRAVE_API_KEY}",
+        "BRAVE_MCP_ENABLED_TOOLS": "brave_web_search brave_news_search brave_llm_context"
+      },
+      "timeout": 20000
+    }
+  }
+}

@@ -1,0 +1,61 @@
+name: 系统功能缺陷
+about: 报告 paper-repro 系统本身的功能异常；不要提交论文项目数据或凭据
+labels: [system-bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        仅报告 paper-repro/OpenCode 集成功能。请勿粘贴 Token、API Key、私有仓库内容、论文 PDF、训练日志或项目绝对路径。
+  - type: input
+    id: version
+    attributes:
+      label: paper-repro 版本
+      placeholder: 1.0.0
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: 受影响组件
+      options:
+        - 安装与升级
+        - OpenCode 命令/Agent
+        - Conda 隔离
+        - PDF/视觉路由
+        - 进度/GPU/日志
+        - MCP/联网
+        - 决策治理
+        - 自我迭代
+        - GitHub 发布
+        - 其他系统功能
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为（请先脱敏）
+      description: 不要包含真实密钥、项目源码、数据、主机名、用户名或绝对路径。
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 最小复现步骤
+      description: 请使用占位路径和示例仓库名。
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: 隐私确认
+      options:
+        - label: 我已确认内容不含 Token、API Key、密码、私钥或认证文件。
+          required: true
+        - label: 我已确认内容不含论文项目源码、PDF、数据集、模型、checkpoint 或训练日志。
+          required: true

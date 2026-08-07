@@ -1,0 +1,37 @@
+.paper-repro/
+.repro/
+runs/
+results/
+__pycache__/
+*.pyc
+*.log
+
+# Local paper-repro state and credentials
+.paper-repro/
+.repro/
+runs/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+auth.json
+credentials.json
+secrets.json
+config.local.json
+
+# Reproduction assets and private project material
+*.pdf
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.parquet
+*.arrow
+wandb/
+datasets/
+models/
+checkpoints/

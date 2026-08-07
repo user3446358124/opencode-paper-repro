@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Paper Repro Self Improvement Record",
+  "type": "object",
+  "required": ["improvement_id", "source", "title", "details", "status"],
+  "properties": {
+    "improvement_id": {"type": "string", "pattern": "^IMP-"},
+    "source": {"enum": ["system-issue", "user-request"]},
+    "source_issue_id": {"type": "string"},
+    "title": {"type": "string"},
+    "details": {"type": "string"},
+    "priority": {"enum": ["low", "normal", "high", "critical"]},
+    "status": {
+      "enum": ["queued", "prepared", "editing", "tested", "test-failed", "proposed", "awaiting-decision", "applied", "apply-failed", "verification-failed", "verified", "discarded", "rolled-back"]
+    },
+    "risk": {"enum": ["none", "low", "medium", "high"]},
+    "changed_files": {"type": "array", "items": {"type": "string"}},
+    "attempts": {"type": "integer", "minimum": 0}
+  }
+}

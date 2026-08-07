@@ -1,0 +1,43 @@
+name: 系统功能建议
+about: 提议改进 paper-repro 通用能力，而非请求修复某个论文仓库
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请描述通用系统能力。不要上传项目材料、服务器信息或任何凭据。
+  - type: textarea
+    id: problem
+    attributes:
+      label: 希望解决的通用问题
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 建议方案
+    validations:
+      required: true
+  - type: textarea
+    id: value
+    attributes:
+      label: 对论文复现流程的价值
+    validations:
+      required: true
+  - type: dropdown
+    id: risk
+    attributes:
+      label: 预计风险
+      options:
+        - 低：文档、显示或只读能力
+        - 中：执行流程或依赖管理
+        - 高：权限、凭据、外部写入或系统修改
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: 隐私确认
+      options:
+        - label: 我没有附带私密项目材料或凭据。
+          required: true

@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://paper-repro.local/schemas/decision.schema.json",
+  "title": "Adaptive Reproduction Decision",
+  "type": "object",
+  "required": ["decision_id", "title", "question", "level", "handling", "status", "options"],
+  "properties": {
+    "decision_id": {"type": "string"},
+    "title": {"type": "string"},
+    "question": {"type": "string"},
+    "category": {"type": "string"},
+    "stage": {"type": "string"},
+    "impact": {"enum": ["low", "medium", "high", "critical"]},
+    "reversibility": {"enum": ["reversible", "partial", "irreversible"]},
+    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    "score": {"type": "integer", "minimum": 0},
+    "level": {"type": "integer", "minimum": 0, "maximum": 3},
+    "handling": {"type": "string"},
+    "requires_user": {"type": "boolean"},
+    "blocking": {"type": "boolean"},
+    "status": {"enum": ["pending", "resolved"]},
+    "selected_option": {"type": "string"},
+    "default_option": {"type": "string"},
+    "recommended_option": {"type": "string"},
+    "preference_key": {"type": "string"},
+    "options": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 5,
+      "items": {
+        "type": "object",
+        "required": ["id", "label"],
+        "properties": {
+          "id": {"type": "string"},
+          "label": {"type": "string"},
+          "consequence": {"type": "string"},
+          "recommended": {"type": "boolean"}
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Static Code Index",
+  "type": "object",
+  "required": ["generated_at", "files_scanned", "language_counts", "python_modules"],
+  "properties": {
+    "generated_at": {"type": "string"},
+    "files_scanned": {"type": "integer", "minimum": 0},
+    "language_counts": {"type": "object"},
+    "entrypoint_candidates": {"type": "array", "items": {"type": "string"}},
+    "python_modules": {"type": "array", "items": {"type": "object"}},
+    "parse_errors": {"type": "array", "items": {"type": "object"}}
+  }
+}
