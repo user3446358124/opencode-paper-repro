@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://paper-repro.local/schemas/remote-contract/v1/capabilities.json",
+  "title": "Paper Reproduction Remote Capabilities v1",
+  "type": "object",
+  "required": ["schema_version", "contract", "paper_repro_version", "generated_at", "capabilities", "cursor_scope", "id_scopes", "truth_confidence_levels", "time_format", "consumer_rules", "remote_write_policy"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "contract": {
+      "type": "object",
+      "required": ["name", "major", "minor", "status", "compatibility"],
+      "properties": {
+        "name": {"const": "paper-repro-remote"},
+        "major": {"const": 1},
+        "minor": {"type": "integer", "minimum": 0},
+        "status": {"const": "frozen"},
+        "compatibility": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "paper_repro_version": {"type": "string"},
+    "generated_at": {"type": "string"},
+    "capabilities": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 1}},
+    "cursor_scope": {"const": "run"},
+    "id_scopes": {
+      "type": "object",
+      "required": ["workspace_id", "run_id", "task_id", "event_id", "decision_id", "request_id", "idempotency_key"],
+      "additionalProperties": {"type": "string"}
+    },
+    "truth_confidence_levels": {
+      "type": "array",
+      "items": {"enum": ["high", "medium", "low", "unknown"]},
+      "minItems": 4,
+      "uniqueItems": true
+    },
+    "time_format": {"const": "RFC3339-with-offset"},
+    "consumer_rules": {
+      "type": "object",
+      "required": ["ignore_unknown_fields", "field_semantics_are_stable_within_capability_major", "capability_version_changes_before_semantic_breaks"],
+      "properties": {
+        "ignore_unknown_fields": {"const": true},
+        "field_semantics_are_stable_within_capability_major": {"const": true},
+        "capability_version_changes_before_semantic_breaks": {"const": true}
+      },
+      "additionalProperties": true
+    },
+    "deprecations": {"type": "array", "items": {"type": "object"}},
+    "remote_write_policy": {
+      "type": "object",
+      "required": ["research_decision_by_id_only", "arbitrary_shell", "opencode_http_proxy", "l3_policy_bypass", "writes_are_audited"],
+      "properties": {
+        "research_decision_by_id_only": {"const": true},
+        "arbitrary_shell": {"const": false},
+        "opencode_http_proxy": {"const": false},
+        "l3_policy_bypass": {"const": false},
+        "writes_are_audited": {"const": true}
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

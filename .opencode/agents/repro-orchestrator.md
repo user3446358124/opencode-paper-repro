@@ -44,7 +44,7 @@ permission:
 3. `coverage`：委派 coverage-judge，生成 `analysis/reproduction_matrix.json`，先报告可复现范围与阻塞项。
 4. `assets`：委派 asset-resolver，生成 `assets/assets.lock.json`。普通 HTTP/HTTPS 大文件优先调用 `repro_download`，以显示断点续传、字节进度、速度和 ETA；Hugging Face/Git LFS 下载必须保留其原生进度输出并登记产物。
 5. `environment`：委派 environment-builder。根据项目约束创建或选择独立项目 Conda，并调用 `repro_environment(action="create"|"use")` 固化；不得把工作区文件夹名自动当成环境名。
-6. `execution`：委派 experiment-runner，按静态检查、单样本、小规模、完整复现逐级运行。长任务通过 `REPRO_PROGRESS current/total message` 同步内部进度。
+6. `execution`：先调用 `repro_runtime(action="gpu-prepare")`。若本次 run 尚未确认 GPU 资源池，必须先把检测到的 GPU 编号/型号/显存/利用率展示给用户，并只询问一次“本次允许调度哪些 GPU？”。收到明确选择后调用 `repro_runtime(action="gpu-configure", gpu_ids=[...])`，再委派 experiment-runner 从 reproduction_matrix 生成完整 execution plan，一次提交给持久调度器。OpenCode 不等待长任务结束。
 7. `verification`：委派 result-verifier，把结果逐单元格对齐论文值并写入 `results/`。
 8. `reporting`：委派 report-writer，生成 `report/report.md` 与 `report/summary.json`，最后将第 8 步和 run 标记完成。
 
@@ -53,6 +53,15 @@ permission:
 - 只有 paper-repro/OpenCode 集成、状态监控、环境隔离、模型路由、日志或工具自身功能异常，才调用 `repro_issue` 进入系统反馈。
 - 连续两轮自动修复仍失败则停止，保留现场并写入 RUN_BLOCKERS.md。
 - 每次进度汇报必须包含：当前第几步/总步数、剩余步数、控制 Conda、项目 Conda、当前任务进度、GPU、耗时和 ETA。
+
+### execution 阶段的硬性边界
+
+- OpenCode 只负责“决定要跑哪些实验”和“生成任务依赖图”；paper-repro runtime 是任务语义、GPU 分配、进度、ETA 和日志归属的唯一事实源。
+- 所有长任务必须通过 `repro_exec`（其 v2 行为是异步提交）或 `repro_runtime(action="plan-submit")` 进入持久队列。禁止用 bash/setsid/nohup 持有训练或评测进程。
+- 多 GPU 调度不由 Agent 临时轮询决定。用户先确认本次可用的物理 GPU 池；调度器只在该池中分配，并默认避开检测为外部繁忙的 GPU。
+- 独立单卡任务自动并行并在任务完成后立即补位；一个真正的 DDP/torchrun 任务使用 `gpu_count=N` 一次性申请 N 张卡。
+- 远程状态先做 `paper-repro remote capabilities --json` 握手，再读取 `remote snapshot` / `remote events`；事件 cursor 必须与 run_id 绑定。nvidia-smi/ps/proc 只做资源遥测和 doctor 诊断，不能用于猜测当前任务名称或进度。OpenCode permission/question/prompt/slash command 仍由 Remote Bridge 直连 OpenCode Server，paper-repro 不代理。
+- execution plan 提交后可以结束当前 agent turn；调度器继续运行。队列完成后由 `/repro-resume`、Remote Bridge 或用户重新进入 verification。
 - 不伪造百分比、时间、GPU 状态或实验结果。
 
 模型路由规则：不得在代理、命令或代码中假设任何供应商或模型名称。调用 `repro_models` 获取能力路由。当前底座具备视觉能力时必须优先原生处理；备用视觉 API 只用于能力缺口或原生处理失败。

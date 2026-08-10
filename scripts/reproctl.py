@@ -26,11 +26,15 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
-from gpu_policy import resolve_gpus as _resolve_gpus
+
+import runtime_engine as rte
+import security as sec
+
+sec.secure_umask()
 
 SYSTEM_HOME = Path(__file__).resolve().parent.parent
 VERSION_FILE = SYSTEM_HOME / "VERSION"
-SYSTEM_VERSION = VERSION_FILE.read_text(encoding="utf-8").strip() if VERSION_FILE.exists() else "1.0.0"
+SYSTEM_VERSION = VERSION_FILE.read_text(encoding="utf-8").strip() if VERSION_FILE.exists() else "2.2.1"
 GLOBAL_STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "opencode-paper-repro"
 REGISTRY_FILE = GLOBAL_STATE / "registry.json"
 GLOBAL_ISSUES = GLOBAL_STATE / "issues.jsonl"
@@ -88,7 +92,6 @@ BLOCKED = [
     re.compile(r"(curl|wget)[^|;&]*\|\s*(bash|sh)(\s|$)", re.I),
 ]
 PROGRESS = re.compile(r"REPRO_PROGRESS\s+(\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)\s*(.*)")
-SECRET = re.compile(r"(?i)(api[_-]?key|token|password|authorization|secret)\s*[:=]\s*\S+")
 
 
 @dataclass(frozen=True)
@@ -150,6 +153,10 @@ class RunPaths:
         return self.root / "execution"
 
     @property
+    def runtime(self) -> Path:
+        return self.root / "runtime"
+
+    @property
     def logs(self) -> Path:
         return self.execution / "logs"
 
@@ -207,6 +214,14 @@ class RunPaths:
         return self.execution / "gpu.csv"
 
     @property
+    def opencode_binding(self) -> Path:
+        return self.meta / "opencode-binding.json"
+
+    @property
+    def remote_commands(self) -> Path:
+        return self.meta / "remote-commands.jsonl"
+
+    @property
     def artifacts(self) -> Path:
         return self.assets / "artifacts.jsonl"
 
@@ -229,16 +244,22 @@ def local_stamp() -> str:
 
 
 def atomic_json(path: Path, data: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    os.replace(tmp, path)
+    os.chmod(path, 0o600)
 
 
 def append_jsonl(path: Path, data: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as f:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as f:
         f.write(json.dumps(data, ensure_ascii=False) + "\n")
+    os.chmod(path, 0o600)
 
 
 def secure_atomic_json(path: Path, data: Any) -> None:
@@ -373,14 +394,11 @@ def read_json(path: Path, default: Any = None) -> Any:
 
 
 def redact(text: str) -> str:
-    redacted = SECRET.sub(lambda m: m.group(1) + "=<REDACTED>", text)
-    redacted = re.sub(
-        r"(?i)([?&](?:access_token|auth|key|signature|sig|token|x-amz-signature)=)[^&\s]+",
-        r"\1<REDACTED>",
-        redacted,
-    )
-    redacted = re.sub(r"(?i)(https?://)[^/@\s:]+:[^/@\s]+@", r"\1<REDACTED>@", redacted)
-    return redacted
+    try:
+        values = list(load_secrets_store().get("secrets", {}).values())
+    except Exception:
+        values = []
+    return sec.redact_text(text, values)
 
 
 def capture(cmd: list[str], cwd: Path | None = None, timeout: int = 20) -> str:
@@ -417,7 +435,29 @@ def save_registry(data: dict[str, Any]) -> None:
 
 def register_workspace(paths: WorkspacePaths, run: Path) -> None:
     registry = load_registry()
-    registry.setdefault("workspaces", {})[str(paths.workspace)] = {
+    workspaces = registry.setdefault("workspaces", {})
+    workspace_id = _workspace_id(paths)
+    current_path = str(paths.workspace)
+    stale_same_id: list[str] = []
+    live_duplicate = False
+    for other_path, info in list(workspaces.items()):
+        if other_path == current_path or info.get("workspace_id") != workspace_id:
+            continue
+        other_state = Path(str(info.get("state_home") or "")).expanduser()
+        if other_state.exists():
+            live_duplicate = True
+        else:
+            stale_same_id.append(other_path)
+    # Moving a workspace preserves identity; copying it into a second live location does not.
+    if live_duplicate:
+        workspace_id = "ws-" + uuid.uuid4().hex[:12]
+        config = workspace_config(paths)
+        config["workspace_id"] = workspace_id
+        save_workspace_config(paths, config)
+    for old_path in stale_same_id:
+        workspaces.pop(old_path, None)
+    workspaces[current_path] = {
+        "workspace_id": workspace_id,
         "state_home": str(paths.state_home),
         "last_run": str(run),
         "updated_at": now(),
@@ -557,6 +597,14 @@ def workspace_config(paths: WorkspacePaths) -> dict[str, Any]:
     paper.setdefault("dpi", 200)
     data.setdefault("decision_policy", {})
     data.setdefault("decision_preferences", {})
+    security = data.setdefault("execution_security", {})
+    sandbox = security.setdefault("sandbox", {})
+    sandbox.setdefault("mode", "auto")
+    sandbox.setdefault("backend", "auto")
+    sandbox.setdefault("network", "on")
+    security.setdefault("allowed_secret_env", [])
+    security.setdefault("allowed_download_roots", [])
+    security.setdefault("privacy_mode", "private")
     return data
 
 
@@ -564,6 +612,58 @@ def save_workspace_config(paths: WorkspacePaths, data: dict[str, Any]) -> None:
     ensure_workspace_layout(paths)
     data["updated_at"] = now()
     atomic_json(paths.config, data)
+
+
+def execution_security_policy(paths: WorkspacePaths) -> dict[str, Any]:
+    return dict(workspace_config(paths).get("execution_security") or {})
+
+
+def _validate_task_secret_env(paths: WorkspacePaths, requested: Iterable[str]) -> list[str]:
+    requested_names = [str(x).strip() for x in requested if str(x).strip()]
+    allowed = {str(x) for x in execution_security_policy(paths).get("allowed_secret_env", [])}
+    outside = [name for name in requested_names if name not in allowed]
+    if outside:
+        raise ReproError(
+            "Task requested secret env not explicitly authorized for this workspace: " + ", ".join(outside) +
+            ". Authorize with: paper-repro security secret allow NAME --yes"
+        )
+    return requested_names
+
+
+def _path_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def allowed_download_roots(paths: WorkspacePaths) -> list[Path]:
+    roots = [paths.workspace.resolve(), paths.cache.resolve()]
+    for item in execution_security_policy(paths).get("allowed_download_roots", []):
+        try:
+            roots.append(Path(str(item)).expanduser().resolve())
+        except Exception:
+            pass
+    unique: list[Path] = []
+    for root in roots:
+        if root not in unique:
+            unique.append(root)
+    return unique
+
+
+def task_sandbox_policy(paths: WorkspacePaths) -> dict[str, Any]:
+    policy = dict(execution_security_policy(paths).get("sandbox") or {})
+    # External roots are never inferred from the host filesystem. They become visible
+    # to sandboxed project code only after the user explicitly authorizes them via
+    # `security download-root add ... --yes`. The workspace/cache are already mounted.
+    external: list[str] = []
+    for root in allowed_download_roots(paths):
+        if _path_within(root, paths.workspace):
+            continue
+        external.append(str(root.resolve()))
+    policy["allowed_roots"] = sorted(set(external))
+    return policy
 
 
 def default_model_routing() -> dict[str, Any]:
@@ -894,11 +994,22 @@ def cmd_decisions_policy_set(args: argparse.Namespace) -> int:
 
 
 def cmd_decisions_assess(args: argparse.Namespace) -> int:
+    # Some tool runtimes historically serialized missing optional values as the literal
+    # string "undefined". Treat those as absent rather than failing a semantic decision.
+    for field in ["default_option", "recommended_option", "preference_key", "stage", "context"]:
+        value = getattr(args, field, "")
+        if str(value).strip().lower() in {"undefined", "null", "none"}:
+            setattr(args, field, "")
     paths = discover_workspace(args.workspace, args.state_root, args.latest)
     run = current_run(paths)
     policy = decision_policy(paths)
     options = _parse_decision_options(args.options_json)
     option_ids = {item["id"] for item in options}
+    marked_recommended = next((str(item["id"]) for item in options if item.get("recommended")), "")
+    if not args.recommended_option and marked_recommended:
+        args.recommended_option = marked_recommended
+    if not args.default_option and args.recommended_option:
+        args.default_option = args.recommended_option
     if args.default_option and args.default_option not in option_ids:
         raise ReproError("--default-option must match one option id")
     if args.recommended_option and args.recommended_option not in option_ids:
@@ -983,6 +1094,11 @@ def cmd_decisions_assess(args: argparse.Namespace) -> int:
         atomic_json(run.decision_checkpoint, {"generated_at": now(), "stage": args.stage, "pending": pending_decisions(run)})
     render_decisions_markdown(run)
     event(run, "decision.assessed", decision_id=decision_id, level=level, handling=handling, requires_user=user_required)
+    if user_required:
+        rte.emit_event(_runtime_paths(paths, run), "decision.created", data={
+            "decision_id": decision_id, "level": level, "stage": args.stage,
+            "title": args.title, "blocking": bool(record.get("blocking", False)),
+        })
     print(json.dumps(record, ensure_ascii=False, indent=2))
     return 0
 
@@ -1026,6 +1142,9 @@ def cmd_decisions_resolve(args: argparse.Namespace) -> int:
     atomic_json(run.decision_checkpoint, {"generated_at": now(), "stage": item.get("stage", ""), "pending": remaining})
     render_decisions_markdown(run)
     event(run, "decision.resolved", decision_id=args.decision_id, selected_option=args.option, remember=args.remember)
+    rte.emit_event(_runtime_paths(paths, run), "decision.resolved", data={
+        "decision_id": args.decision_id, "selected_option": args.option, "remember": args.remember, "source": "local-cli",
+    })
     print(json.dumps({"decision_id": args.decision_id, "selected_option": args.option, "remaining_pending": len(remaining)}, ensure_ascii=False, indent=2))
     return 0
 
@@ -2041,7 +2160,7 @@ def build_mcp_runtime_config(settings: dict[str, Any]) -> dict[str, Any]:
         brave_environment["BRAVE_API_KEY"] = "{env:BRAVE_API_KEY}"
     servers["brave-search"] = {
         "type": "local",
-        "command": ["npx", "-y", "@brave/brave-search-mcp-server", "--transport", "stdio"],
+        "command": ["npx", "-y", "@brave/brave-search-mcp-server@2.1.0", "--transport", "stdio"],
         "enabled": bool(settings["servers"]["brave-search"]["enabled"]),
         "environment": brave_environment,
         "timeout": 20000,
@@ -2342,7 +2461,7 @@ def ensure_workspace_layout(paths: WorkspacePaths) -> None:
 
 
 def ensure_run_layout(run: RunPaths) -> None:
-    for directory in [run.meta, run.analysis, run.assets, run.environment, run.logs, run.results, run.report, run.code_guide]:
+    for directory in [run.meta, run.analysis, run.assets, run.environment, run.logs, run.results, run.report, run.code_guide, run.runtime]:
         directory.mkdir(parents=True, exist_ok=True)
     compatibility = {
         "manifest.json": "meta/manifest.json",
@@ -2552,6 +2671,9 @@ def record_blocker(
         kind="blocker",
     )
     event(run, "project.blocker.opened", blocker_id=record["blocker_id"], severity=severity, title=title)
+    rte.emit_event(_runtime_paths(paths, run), "blocker.created", data={
+        "blocker_id": record["blocker_id"], "severity": severity, "title": title, "stage": record.get("stage"),
+    })
     return record
 
 
@@ -2620,13 +2742,28 @@ def cmd_init(args: argparse.Namespace) -> int:
     active_conda()
     paths = discover_workspace(args.workspace, args.state_root, args.latest)
     ensure_workspace_layout(paths)
-    if not paths.config.exists():
+    config_existed = paths.config.exists()
+    if not config_existed:
         config = workspace_config(paths)
         config["created_at"] = now()
+        config["workspace_id"] = "ws-" + uuid.uuid4().hex[:12]
         save_workspace_config(paths, config)
+    else:
+        _workspace_id(paths)  # migrate and persist the v2.1 path-derived ID once
     run_id = local_stamp() + "-" + uuid.uuid4().hex[:8]
     run = RunPaths(paths.runs / run_id)
     ensure_run_layout(run)
+    runtime = rte.RuntimePaths(run.root)
+    runtime.ensure()
+    # GPU pool is intentionally NOT auto-confirmed. Each run asks once before GPU tasks start.
+    initial_gpu_policy = rte.default_gpu_policy()
+    defaults = _runtime_workspace_defaults(paths)
+    if defaults.get("default_gpu_ids"):
+        initial_gpu_policy["allowed_gpu_ids"] = list(defaults["default_gpu_ids"])
+        initial_gpu_policy["selection_source"] = "workspace-suggestion"
+    if defaults.get("max_parallel_tasks") is not None:
+        initial_gpu_policy.setdefault("scheduler", {})["max_parallel_tasks"] = int(defaults["max_parallel_tasks"])
+    atomic_json(runtime.gpu_policy, initial_gpu_policy)
     atomic_json(run.manifest, system_manifest(paths, args.repository, args.paper, run))
     control_env = active_conda_info()
     project_env = configured_execution_env(paths)
@@ -2666,6 +2803,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     atomic_json(paths.enabled, {"enabled_at": now(), "workspace": str(paths.workspace), "run_id": run_id, "system_version": SYSTEM_VERSION})
     register_workspace(paths, run.root)
     event(run, "run.created", repository=args.repository, paper=args.paper)
+    rte.emit_event(runtime, "run.started", data={"stage": "paper-audit"})
     render_issue_markdown(run.report / "RUN_BLOCKERS.md", "本次论文复现阻塞项", [], kind="blocker")
     render_decisions_markdown(run)
     render_issue_markdown(paths.system / "SYSTEM_ISSUES.md", "系统功能与优化问题汇总", issue_records(paths.system / "issues.jsonl"), kind="system")
@@ -2737,47 +2875,6 @@ def execution_argv(paths: WorkspacePaths, command: str) -> tuple[list[str], dict
     return [conda, "run", "--no-capture-output", "-p", project_prefix, "bash", "-lc", command], project
 
 
-def recent_gpu_allocations(run: RunPaths) -> list[str]:
-    """GPU indexes allocated by project commands that are still running.
-
-    Reads commands.jsonl start/finish records so a later `auto` exec avoids
-    cards already in use by the current run (multi-GPU parallelism without
-    manual bookkeeping).
-    """
-    running: dict[str, str] = {}
-    if run.commands.exists():
-        try:
-            lines = run.commands.read_text(encoding="utf-8").splitlines()
-        except OSError:
-            lines = []
-        for line in lines:
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            record_id = str(record.get("id", ""))
-            if record.get("record_type") == "start":
-                running[record_id] = str(record.get("gpus_index") or "")
-            elif record.get("record_type") == "finish":
-                running.pop(record_id, None)
-    return sorted({value for value in running.values() if value})
-
-
-def configured_gpus_default(paths: WorkspacePaths) -> str:
-    """gpus default from .paper-repro/config.json execution_env.gpus_default.
-
-    Falls back to "auto" silently when the config is missing or invalid.
-    """
-    try:
-        env = workspace_config(paths).get("execution_env") or {}
-        value = env.get("gpus_default")
-        if isinstance(value, str) and value:
-            return value
-    except Exception:
-        pass
-    return "auto"
-
-
 def cmd_exec(args: argparse.Namespace) -> int:
     paths = discover_workspace(args.workspace, args.state_root, args.latest)
     safe_command(args.command)
@@ -2792,9 +2889,6 @@ def cmd_exec(args: argparse.Namespace) -> int:
         )
     ensure_run_layout(run)
     argv, project_env = execution_argv(paths, args.command)
-    gpus_policy = args.gpus if args.gpus else (configured_gpus_default(paths) or "auto")
-    excluded_gpus = recent_gpu_allocations(run)
-    cuda_visible, gpu_note = _resolve_gpus(gpus_policy, args.command, gpu_rows, exclude=excluded_gpus)
     control_env = active_conda_info()
     print(environment_banner(paths, run), flush=True)
     command_id = datetime.now().strftime("%H%M%S") + "-" + uuid.uuid4().hex[:6]
@@ -2838,8 +2932,6 @@ def cmd_exec(args: argparse.Namespace) -> int:
         "estimate_seconds": estimate,
         "control_env": control_env,
         "execution_env": project_env,
-        "gpus": gpu_note,
-        "gpus_index": cuda_visible or "",
         "argv": [redact(item) for item in argv],
     }
     append_jsonl(run.commands, start_record)
@@ -2849,7 +2941,18 @@ def cmd_exec(args: argparse.Namespace) -> int:
     watcher = threading.Thread(target=monitor_gpu, args=(run.gpu, stop), daemon=True)
     watcher.start()
 
-    env = os.environ.copy()
+    sec_policy = execution_security_policy(paths)
+    sandbox_policy = task_sandbox_policy(paths)
+    if str(sandbox_policy.get("mode", "auto")) != "trusted-off" and not rte.sandbox_backend_status().get("available"):
+        raise DecisionPendingError(
+            "短时项目命令同样要求 OS 沙箱，但当前未检测到 bwrap。"
+            "安装后重试；仅对已审查仓库可由用户显式设置 trusted-off。"
+        )
+    requested_secret_env = _validate_task_secret_env(paths, args.secret_env or [])
+    env = sec.scrub_environment(os.environ.copy(), allow_names=requested_secret_env)
+    for name in requested_secret_env:
+        if name in os.environ:
+            env[name] = os.environ[name]
     env.update({
         "REPRO_WORKSPACE": str(paths.workspace),
         "REPRO_STATE_HOME": str(paths.state_home),
@@ -2861,8 +2964,15 @@ def cmd_exec(args: argparse.Namespace) -> int:
     env.setdefault("XDG_CACHE_HOME", str(paths.cache))
     env.setdefault("WANDB_MODE", "offline")
     env.setdefault("PYTHONUNBUFFERED", "1")
-    if cuda_visible is not None:
-        env["CUDA_VISIBLE_DEVICES"] = cuda_visible
+    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+    sandbox_spec = {
+        "task_id": f"CMD-{command_id}",
+        "workspace": str(paths.workspace),
+        "execution_env": project_env,
+        "sandbox": sandbox_policy,
+    }
+    argv, sandbox_state = rte.build_sandbox_argv(rte.RuntimePaths(run.root), sandbox_spec, argv, env, [])
+    start_record["sandbox"] = sandbox_state
 
     proc = subprocess.Popen(
         argv,
@@ -2885,7 +2995,6 @@ def cmd_exec(args: argparse.Namespace) -> int:
                 f"# cwd={paths.workspace}\n"
                 f"# control_conda={control_env['name']} ({control_env['prefix']})\n"
                 f"# project_conda={project_env['name']} ({project_env['prefix']})\n"
-                f"# gpus={gpu_note}\n"
                 f"# started_at={now()}\n"
                 f"# command={redact(args.command)}\n\n"
             )
@@ -2997,7 +3106,6 @@ def cmd_exec(args: argparse.Namespace) -> int:
         "run_id": run.root.name,
         "control_env": control_env,
         "execution_env": project_env,
-        "gpus": gpu_note,
     }, ensure_ascii=False, indent=2))
     return 0 if code == 0 and not timed_out else code or 1
 
@@ -3043,7 +3151,7 @@ def cmd_register(args: argparse.Namespace) -> int:
     return 0
 
 
-def status_dict(paths: WorkspacePaths) -> dict[str, Any]:
+def status_dict(paths: WorkspacePaths, include_runtime: bool = True) -> dict[str, Any]:
     run = current_run(paths)
     state = read_json(run.state, {})
     if not state:
@@ -3067,6 +3175,38 @@ def status_dict(paths: WorkspacePaths) -> dict[str, Any]:
     state["publication_count"] = len([item for item in publications if item.get("status") not in {"published", "published-pr", "no-changes", "aborted"}])
     state["publication_target"] = _publish_target(github_publish_policy())
     state["issue_count"] = state["system_issue_count"]  # compatibility
+    if include_runtime:
+        try:
+            runtime = _runtime_paths(paths, run)
+            snapshot = rte.refresh_snapshot(runtime)
+            state["runtime"] = snapshot
+            state["scheduler"] = snapshot.get("scheduler") or {}
+            state["gpu_pool"] = (snapshot.get("gpu") or {}).get("policy") or {}
+            state["active_tasks"] = snapshot.get("active_tasks") or []
+            state["queued_task_count"] = int((snapshot.get("queue") or {}).get("queued", 0))
+            state["active_task_count"] = int((snapshot.get("queue") or {}).get("active", 0))
+            # Keep the legacy single-task field useful for older clients.
+            compat = (snapshot.get("active_tasks") or [])[:1]
+            if not compat:
+                compat = [t for t in snapshot.get("tasks", []) if t.get("state") in rte.QUEUE_STATES][:1]
+            if compat:
+                item = compat[0]
+                prog = item.get("progress") or {}
+                state["task"] = {
+                    "name": item.get("display_name"),
+                    "status": item.get("state"),
+                    "progress": (float(prog.get("percent", 0.0)) / 100.0),
+                    "completed": prog.get("current"),
+                    "total": prog.get("total"),
+                    "unit": prog.get("unit", ""),
+                    "speed": prog.get("speed"),
+                    "eta_seconds": prog.get("eta_seconds"),
+                    "message": prog.get("message", ""),
+                    "task_id": item.get("task_id"),
+                    "gpu_ids": item.get("gpu_ids", []),
+                }
+        except Exception as exc:  # keep status available even if runtime metadata is damaged
+            state["runtime_error"] = str(exc)
     return state
 
 
@@ -3075,6 +3215,10 @@ def _zh_status(value: Any) -> str:
         "initialized": "已初始化", "running": "运行中", "pending": "等待中", "completed": "已完成",
         "failed": "失败", "blocked": "已阻塞", "succeeded": "成功", "timeout": "超时",
         "idle": "空闲", "unknown": "未知", "configured": "已配置", "awaiting-decision": "等待决策",
+        "execution-complete": "执行完成，等待核验", "starting": "启动中",
+        "waiting-resources": "等待资源", "waiting-dependencies": "等待前置任务",
+        "cancelled": "已取消", "stale": "状态陈旧", "waiting-gpu-confirmation": "等待 GPU 确认",
+        "external-busy": "外部任务占用", "available": "可调度", "assigned": "已分配", "not-allowed": "未授权调度",
     }
     return mapping.get(str(value), str(value))
 
@@ -3152,6 +3296,14 @@ def cmd_status(args: argparse.Namespace) -> int:
         policy = state.get("decision_policy") or {}
         mode_label = DECISION_MODES.get(str(policy.get("mode")), {}).get("label", str(policy.get("mode", "")))
         table.add_row("决策模式", f"{mode_label} · 待确认 {state.get('pending_decision_count', 0)} 项")
+        runtime_state = state.get("runtime") or {}
+        scheduler_state = runtime_state.get("scheduler") or {}
+        queue_state = runtime_state.get("queue") or {}
+        gpu_policy = (runtime_state.get("gpu") or {}).get("policy") or {}
+        table.add_row("执行调度器", f"{_zh_status(scheduler_state.get('state', 'stopped'))} · PID {scheduler_state.get('pid') or '-'}")
+        table.add_row("任务队列", f"总计 {queue_state.get('total', 0)} · 运行 {queue_state.get('active', 0)} · 等待 {queue_state.get('queued', 0)} · 成功 {queue_state.get('succeeded', 0)} · 失败 {queue_state.get('failed', 0)}")
+        pool_ids = gpu_policy.get("allowed_gpu_ids", [])
+        table.add_row("本次 GPU 资源池", (",".join(f"GPU{x}" for x in pool_ids) if gpu_policy.get("configured") else "尚未确认；执行 GPU 任务前必须确认"))
         table.add_row("运行目录", str(state.get("run_path")))
         console.clear()
         console.print(table)
@@ -3165,8 +3317,27 @@ def cmd_status(args: argparse.Namespace) -> int:
             for step in steps:
                 step_table.add_row(str(step.get("index")), str(step.get("id")), str(step.get("name")), _zh_status(step.get("status")))
             console.print(step_table)
+        runtime_tasks = (state.get("runtime") or {}).get("tasks") or []
+        if runtime_tasks:
+            rt_table = Table(title="执行任务队列")
+            for label in ["任务 ID", "名称", "状态", "GPU", "进度", "ETA", "进度来源"]:
+                rt_table.add_column(label)
+            for item in runtime_tasks:
+                prog = item.get("progress") or {}
+                pct = prog.get("percent")
+                progress_text = f"{float(pct):.1f}%" if isinstance(pct, (int, float)) else "未知"
+                cur, total = prog.get("current"), prog.get("total")
+                if total is not None:
+                    progress_text += f" ({cur}/{total} {prog.get('unit','')})"
+                gpu_text = ",".join(f"GPU{x}" for x in (item.get("gpu_ids") or [])) or ("CPU" if int((item.get("gpu_request") or {}).get("count", 1) or 0) == 0 else "待分配")
+                rt_table.add_row(
+                    str(item.get("task_id", "")), str(item.get("display_name", "")),
+                    _zh_status(item.get("state")), gpu_text, progress_text,
+                    _format_seconds(prog.get("eta_seconds")), str(prog.get("source", "unknown")),
+                )
+            console.print(rt_table)
         task = state.get("task") or {}
-        if task.get("name"):
+        if task.get("name") and not runtime_tasks:
             task_table = Table(title="当前任务")
             task_table.add_column("项目")
             task_table.add_column("当前值")
@@ -3209,22 +3380,1063 @@ def cmd_status(args: argparse.Namespace) -> int:
                     str(item.get("recommended_option") or item.get("default_option") or ""),
                 )
             console.print(decision_table)
-        gpus = state.get("last_gpu") or []
+        runtime_gpu = ((state.get("runtime") or {}).get("gpu") or {}).get("gpus") or []
+        gpus = runtime_gpu or state.get("last_gpu") or []
         if gpus:
-            gpu_table = Table(title="GPU 状态")
-            labels = {
-                "index": "编号", "name": "型号", "utilization_gpu": "利用率(%)", "memory_used": "已用显存(MiB)",
-                "memory_total": "总显存(MiB)", "temperature_gpu": "温度(℃)", "power_draw": "功耗(W)",
-            }
-            keys = list(gpus[0].keys())
-            for key in keys:
-                gpu_table.add_column(labels.get(key, key))
+            gpu_table = Table(title="GPU 状态与任务归属")
+            columns = [
+                ("index", "编号"), ("name", "型号"), ("util_gpu_pct", "利用率(%)"),
+                ("memory_used_mb", "已用显存(MiB)"), ("memory_free_mb", "空闲显存(MiB)"),
+                ("memory_total_mb", "总显存(MiB)"), ("temperature_c", "温度(℃)"),
+                ("scheduler_state", "调度状态"), ("assigned_task_ids", "paper-repro 任务"),
+            ]
+            available_keys = [item for item in columns if item[0] in gpus[0]]
+            for _, label in available_keys:
+                gpu_table.add_column(label)
             for row in gpus:
-                gpu_table.add_row(*(str(row.get(key, "")) for key in keys))
+                values = []
+                for key, _ in available_keys:
+                    value = row.get(key, "")
+                    if key == "scheduler_state":
+                        value = _zh_status(value)
+                    if isinstance(value, list):
+                        value = ",".join(str(x) for x in value)
+                    values.append(str(value))
+                gpu_table.add_row(*values)
             console.print(gpu_table)
         if not args.watch:
             break
         time.sleep(args.interval)
+    return 0
+
+def _runtime_paths(paths: WorkspacePaths, run: RunPaths | None = None) -> rte.RuntimePaths:
+    run = run or current_run(paths)
+    runtime = rte.RuntimePaths(run.root)
+    runtime.ensure()
+    return runtime
+
+
+def _parse_gpu_ids(raw: str) -> list[int]:
+    values: list[int] = []
+    for item in str(raw or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            value = int(item)
+        except ValueError as exc:
+            raise ReproError(f"GPU ID 必须是整数：{item}") from exc
+        if value < 0:
+            raise ReproError("GPU ID 不能为负数")
+        if value not in values:
+            values.append(value)
+    return values
+
+
+def _runtime_workspace_defaults(paths: WorkspacePaths) -> dict[str, Any]:
+    config = workspace_config(paths)
+    runtime_cfg = config.get("runtime", {}) or {}
+    return {
+        "default_gpu_ids": [int(x) for x in runtime_cfg.get("default_gpu_ids", [])],
+        "max_parallel_tasks": runtime_cfg.get("max_parallel_tasks"),
+        "confirm_each_run": bool(runtime_cfg.get("confirm_each_run", True)),
+    }
+
+
+def cmd_gpu_prepare(args: argparse.Namespace) -> int:
+    paths = discover_workspace(args.workspace, args.state_root, args.latest)
+    run = current_run(paths)
+    runtime = _runtime_paths(paths, run)
+    telemetry = rte.parse_nvidia_smi()
+    policy = rte.load_gpu_policy(runtime)
+    defaults = _runtime_workspace_defaults(paths)
+    detected = [int(row["index"]) for row in telemetry if row.get("index") is not None]
+    suggested = [x for x in defaults.get("default_gpu_ids", []) if x in detected] or detected
+    payload = {
+        "schema_version": 1,
+        "run_id": run.root.name,
+        "configured_for_run": bool(policy.get("configured")),
+        "requires_confirmation": not bool(policy.get("configured")),
+        "detected_gpus": telemetry,
+        "workspace_default_gpu_ids": defaults.get("default_gpu_ids", []),
+        "suggested_gpu_ids": suggested,
+        "current_policy": policy,
+        "question_zh": (
+            "本次复现允许 paper-repro 调度哪些 GPU？请从检测到的 GPU 编号中选择；"
+            "调度器只会使用你确认的 GPU，并默认避开检测到的外部繁忙 GPU。"
+        ),
+        "answer_examples": [
+            ",".join(str(x) for x in suggested) if suggested else "none",
+            str(suggested[0]) if suggested else "none",
+            "none",
+        ],
+    }
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_gpu_inspect(args: argparse.Namespace) -> int:
+    paths = discover_workspace(args.workspace, args.state_root, args.latest)
+    run = current_run(paths)
+    runtime = _runtime_paths(paths, run)
+    print(json.dumps(rte.gpu_snapshot(runtime), ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_gpu_show(args: argparse.Namespace) -> int:
+    paths = discover_workspace(args.workspace, args.state_root, args.latest)
+    run = current_run(paths)
+    runtime = _runtime_paths(paths, run)
+    print(json.dumps({
+        "run_id": run.root.name,
+        "policy": rte.load_gpu_policy(runtime),
+        "workspace_defaults": _runtime_workspace_defaults(paths),
+        "telemetry": rte.gpu_snapshot(runtime),
+    }, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_gpu_configure(args: argparse.Namespace) -> int:
+    paths = discover_workspace(args.workspace, args.state_root, args.latest)
+    run = current_run(paths)
+    runtime = _runtime_paths(paths, run)
+    telemetry = rte.parse_nvidia_smi()
+    detected = {int(row["index"]) for row in telemetry if row.get("index") is not None}
+    raw = args.ids
+    if args.interactive:
+        print("检测到 GPU：")
+        if telemetry:
+            for row in telemetry:
+                print(
+                    f"  GPU{row.get('index')}: {row.get('name')} · "
+                    f"显存 {row.get('memory_used_mb')}/{row.get('memory_total_mb')} MiB · "
+                    f"利用率 {row.get('util_gpu_pct')}%"
+                )
+        else:
+            print("  未检测到 NVIDIA GPU")
+        default_ids = _runtime_workspace_defaults(paths).get("default_gpu_ids", []) or sorted(detected)
+        default_text = ",".join(str(x) for x in default_ids)
+        raw = input(f"本次允许调度的 GPU ID（逗号分隔；none=只跑 CPU）[{default_text or 'none'}]: ").strip() or default_text
+    if str(raw).strip().lower() in {"none", "cpu", "cpu-only"}:
+        gpu_ids: list[int] = []
+    else:
+        gpu_ids = _parse_gpu_ids(raw)
+    missing = [idx for idx in gpu_ids if idx not in detected]
+    if missing and not args.allow_missing:
+        raise ReproError(f"这些 GPU 当前不可见：{missing}；检测到：{sorted(detected)}")
+    current = rte.load_gpu_policy(runtime)
+    sched = dict(current.get("scheduler") or {})
+    if args.max_parallel is not None:
+        sched["max_parallel_tasks"] = int(args.max_parallel)
+    elif gpu_ids:
+        sched["max_parallel_tasks"] = min(max(1, int(sched.get("max_parallel_tasks", len(gpu_ids)))), len(gpu_ids))
+    else:
+        sched["max_parallel_tasks"] = max(1, int(args.cpu_parallel or 1))
+    if args.external_busy_memory_mb is not None:
+        sched["external_busy_memory_mb"] = int(args.external_busy_memory_mb)
+    if args.external_busy_util_pct is not None:
+        sched["external_busy_util_pct"] = int(args.external_busy_util_pct)
+    sched["allow_external_busy"] = bool(args.allow_external_busy)
+    policy = {
+        **current,
+        "allowed_gpu_ids": gpu_ids,
+        "cpu_allowed": True,
+        "selection_source": "user-confirmed",
+        "scheduler": sched,
+    }
+    saved = rte.save_gpu_policy(runtime, policy)
+    gpu_decision_id = "dec-gpu-" + uuid.uuid4().hex[:8]
+    selection_id = "cpu-only" if not gpu_ids else "gpu-" + "-".join(str(x) for x in gpu_ids)
+    append_jsonl(run.decisions, {
+        "ts": now(), "action": "opened", "decision_id": gpu_decision_id,
+        "title": "确认本次 GPU 调度资源池",
+        "question": "本次复现允许 paper-repro 自动调度哪些物理 GPU？",
+        "category": "gpu-resource-pool", "stage": "execution", "impact": "high",
+        "reversibility": "reversible", "confidence": 1.0, "score": 0, "level": 2,
+        "handling": "用户明确确认", "requires_user": False, "blocking": False,
+        "options": [{"id": selection_id, "label": ("CPU only" if not gpu_ids else ",".join(f"GPU{x}" for x in gpu_ids)), "consequence": "调度器仅使用该资源池", "recommended": True}],
+        "default_option": selection_id, "recommended_option": selection_id,
+        "preference_key": "runtime.gpu_pool", "reasons": ["GPU 资源归属影响并行度、费用与服务器其他任务"],
+        "status": "resolved", "selected_option": selection_id, "context": "run-level GPU pool confirmation",
+        "user_involved": True,
+    })
+    render_decisions_markdown(run)
+    if args.remember_workspace:
+        config = workspace_config(paths)
+        runtime_cfg = config.setdefault("runtime", {})
+        runtime_cfg["default_gpu_ids"] = gpu_ids
+        runtime_cfg["max_parallel_tasks"] = sched.get("max_parallel_tasks")
+        runtime_cfg["confirm_each_run"] = True
+        runtime_cfg["updated_at"] = now()
+        save_workspace_config(paths, config)
+    event(run, "gpu.pool.confirmed", gpu_ids=gpu_ids, remember_workspace=bool(args.remember_workspace))
+    print(json.dumps({
+        "configured": True,
+        "run_id": run.root.name,
+        "gpu_ids": gpu_ids,
+        "scheduler": sched,
+        "remembered_workspace": bool(args.remember_workspace),
+        "note": "调度器只会使用这些 GPU；未被选择的 GPU 不属于本次复现资源池。",
+    }, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _parse_progress_adapter(raw: str) -> dict[str, Any]:
+    if not raw:
+        return {"type": "auto"}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ReproError(f"Invalid progress adapter JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ReproError("progress adapter must be a JSON object")
+    allowed = {"auto", "native", "tqdm", "jsonl-line-count", "line-count", "file-count", "regex-log"}
+    kind = str(data.get("type", "auto"))
+    if kind not in allowed:
+        raise ReproError(f"Unsupported progress adapter: {kind}")
+    data["type"] = kind
+    return data
+
+
+def _ensure_runtime_submission_allowed(paths: WorkspacePaths, run: RunPaths) -> dict[str, Any]:
+    blocked = pending_decisions(run, blocking_only=True)
+    if blocked:
+        titles = "；".join(str(item.get("title", item.get("decision_id"))) for item in blocked[:5])
+        raise DecisionPendingError(
+            f"当前有 {len(blocked)} 项待确认决策，已阻止提交新任务：{titles}\n"
+            "查看：paper-repro decisions checkpoint"
+        )
+    project_env = configured_execution_env(paths)
+    if not project_env:
+        raise DecisionPendingError(
+            "项目 Conda 尚未配置，无法提交执行任务。先运行 paper-repro env create/use。"
+        )
+    sandbox = dict(execution_security_policy(paths).get("sandbox") or {})
+    if str(sandbox.get("mode", "auto")) != "trusted-off" and not rte.sandbox_backend_status().get("available"):
+        raise DecisionPendingError(
+            "执行安全策略要求 OS 沙箱，但当前未检测到 bubblewrap/bwrap。"
+            "安装 bwrap 后重试；若该仓库已人工审查且你愿意承担同用户权限风险，"
+            "可显式执行 paper-repro security sandbox set --mode trusted-off --yes。"
+        )
+    return project_env
+
+
+def _ensure_scheduler(paths: WorkspacePaths, run: RunPaths) -> dict[str, Any]:
+    runtime = _runtime_paths(paths, run)
+    return rte.start_scheduler_detached(runtime, str(Path(__file__).resolve()), str(paths.workspace))
+
+
+def cmd_runtime_submit(args: argparse.Namespace) -> int:
+    paths = discover_workspace(args.workspace, args.state_root, args.latest)
+    run = current_run(paths)
+    project_env = _ensure_runtime_submission_allowed(paths, run)
+    safe_command(args.command)
+    runtime = _runtime_paths(paths, run)
+    preferred = _parse_gpu_ids(args.gpu_ids)
+    dependencies = [item.strip() for item in (args.depends_on or []) if item.strip()]
+    sec_policy = execution_security_policy(paths)
+    secret_env = _validate_task_secret_env(paths, args.secret_env or [])
+    task = rte.add_task(
+        runtime,
+        display_name=args.name,
+        stage=args.stage,
+        command=args.command,
+        workspace=str(paths.workspace),
+        execution_env=project_env,
+        timeout_seconds=args.timeout,
+        estimate_seconds=args.estimate,
+        gpu_count=args.gpu_count,
+        gpu_ids=preferred,
+        min_free_memory_mb=args.min_free_memory_mb,
+        priority=args.priority,
+        dependencies=dependencies,
+        parallel_group_id=args.parallel_group or None,
+        progress_adapter=_parse_progress_adapter(args.progress_adapter),
+        output_paths=list(args.output or []),
+        sandbox_policy=task_sandbox_policy(paths),
+        secret_env=secret_env,
+    )
+    scheduler = _ensure_scheduler(paths, run) if args.start_scheduler else rte.scheduler_state(runtime)
+    update_state(run, status="running", stage="execution", message=f"任务已进入持久队列：{args.name}")
+    print(json.dumps({"task": task, "scheduler": scheduler}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _load_plan_input(args: argparse.Namespace, paths: WorkspacePaths) -> dict[str, Any]:
+    if getattr(args, "file", ""):
+        target = Path(args.file)
+        if not target.is_absolute():
+            target = paths.workspace / target
+        try:
+            data = json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ReproError(f"Cannot read execution plan {target}: {exc}") from exc
+    else:
+        raw = getattr(args, "tasks_json", "")
+        if not raw:
+            raise ReproError("Provide --file or --tasks-json")
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ReproError(f"Invalid --tasks-json: {exc}") from exc
+        data = parsed if isinstance(parsed, dict) else {"tasks": parsed}
+    if not isinstance(data, dict):
+        raise ReproError("Execution plan must be a JSON object")
+    data.setdefault("source", "opencode-agent")
+    data.setdefault("workspace", str(paths.workspace))
+    return data
+
+
+def cmd_runtime_plan_save(args: argparse.Namespace) -> int:
+    paths = discover_workspace(args.workspace, args.state_root, args.latest)
+    run = current_run(paths)
+    runtime = _runtime_paths(paths, run)
+    plan = _load_plan_input(args, paths)
+    for item in plan.get("tasks", []):
+        safe_command(str(item.get("command", "")))
+    saved = rte.save_plan(runtime, plan)
+    print(json.dumps({"plan_path": str(runtime.plan), "plan": saved}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_runtime_plan_show(args: argparse.Namespace) -> int:
+    paths = discover_workspace(args.workspace, args.state_root, args.latest)
+    run = current_run(paths)
+    runtime = _runtime_paths(paths, run)
+    plan = read_json(runtime.plan, {}) or {}
+    print(json.dumps(plan, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_runtime_plan_submit(args: argparse.Namespace) -> int:
+    paths = discover_workspace(args.workspace, args.state_root, args.latest)
+    run = current_run(paths)
+    project_env = _ensure_runtime_submission_allowed(paths, run)
+    runtime = _runtime_paths(paths, run)
+    if args.file or args.tasks_json:
+        plan = _load_plan_input(args, paths)
+        for item in plan.get("tasks", []):
+            safe_command(str(item.get("command", "")))
+        rte.save_plan(runtime, plan)
+    else:
+        plan = read_json(runtime.plan, {}) or {}
+    if not plan:
+        raise ReproError("No execution plan exists. Save a plan first.")
+    for item in plan.get("tasks", []):
+        safe_command(str(item.get("command", "")))
+    existing = {t.get("task_id") for t in rte.read_tasks(runtime)}
+    sec_policy = execution_security_policy(paths)
+    pending_plan = dict(plan)
+    pending_tasks = [dict(item) for item in plan.get("tasks", []) if item.get("task_id") not in existing]
+    for item in pending_tasks:
+        item["secret_env"] = _validate_task_secret_env(paths, item.get("secret_env") or [])
+        item["sandbox"] = task_sandbox_policy(paths)
+    pending_plan["sandbox"] = task_sandbox_policy(paths)
+    pending_plan["tasks"] = pending_tasks
+    created = rte.submit_plan(runtime, pending_plan, project_env, str(paths.workspace)) if pending_plan["tasks"] else []
+    scheduler = _ensure_scheduler(paths, run)
+    gpu_prepare = {
+        "configured": bool(rte.load_gpu_policy(runtime).get("configured")),
+        "command": "paper-repro gpu prepare --json",
+    }
+    update_state(run, status="running", stage="execution", message=f"执行计划已提交：新增 {len(created)} 个任务")
+    print(json.dumps({
+        "run_id": run.root.name,
+        "submitted": len(created),
+        "already_present": len(plan.get("tasks", [])) - len(created),
+        "scheduler": scheduler,
+        "gpu_pool": gpu_prepare,
+        "tasks": created,
+    }, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_runtime_status(args: argparse.Namespace) -> int:
+    paths = discover_workspace(args.workspace, args.state_root, args.latest)
+    run = current_run(paths)
+    runtime = _runtime_paths(paths, run)
+    payload = rte.refresh_snapshot(runtime)
+    payload["run_state"] = status_dict(paths, include_runtime=False)
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_runtime_tasks(args: argparse.Namespace) -> int:
+    paths = discover_workspace(args.workspace, args.state_root, args.latest)
+    run = current_run(paths)
+    tasks = rte.read_tasks(_runtime_paths(paths, run))
+    if args.active:
+        tasks = [t for t in tasks if t.get("state") in rte.ACTIVE_STATES]
+    if args.pending:
+        tasks = [t for t in tasks if t.get("state") in rte.QUEUE_STATES]
+    print(json.dumps(tasks, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_runtime_task(args: argparse.Namespace) -> int:
+    paths = discover_workspace(args.workspace, args.state_root, args.latest)
+    run = current_run(paths)
+    task = rte.task_by_id(_runtime_paths(paths, run), args.task_id)
+    if not task:
+        raise ReproError(f"Task not found: {args.task_id}")
+    print(json.dumps(task, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_runtime_gpu(args: argparse.Namespace) -> int:
+    paths = discover_workspace(args.workspace, args.state_root, args.latest)
+    run = current_run(paths)
+    print(json.dumps(rte.gpu_snapshot(_runtime_paths(paths, run)), ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_runtime_events(args: argparse.Namespace) -> int:
+    paths = discover_workspace(args.workspace, args.state_root, args.latest)
+    run = current_run(paths)
+    events = rte.read_events_after(_runtime_paths(paths, run), args.after or None, limit=args.limit)
+    print(json.dumps(events, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_runtime_cancel(args: argparse.Namespace) -> int:
+    paths = discover_workspace(args.workspace, args.state_root, args.latest)
+    run = current_run(paths)
+    print(json.dumps(rte.cancel_task(_runtime_paths(paths, run), args.task_id), ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_runtime_retry(args: argparse.Namespace) -> int:
+    paths = discover_workspace(args.workspace, args.state_root, args.latest)
+    run = current_run(paths)
+    runtime = _runtime_paths(paths, run)
+    item = rte.retry_task(runtime, args.task_id)
+    scheduler = _ensure_scheduler(paths, run)
+    print(json.dumps({"task": item, "scheduler": scheduler}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_scheduler_start(args: argparse.Namespace) -> int:
+    paths = discover_workspace(args.workspace, args.state_root, args.latest)
+    run = current_run(paths)
+    print(json.dumps(_ensure_scheduler(paths, run), ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_scheduler_status(args: argparse.Namespace) -> int:
+    paths = discover_workspace(args.workspace, args.state_root, args.latest)
+    run = current_run(paths)
+    print(json.dumps(rte.scheduler_state(_runtime_paths(paths, run)), ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_scheduler_stop(args: argparse.Namespace) -> int:
+    paths = discover_workspace(args.workspace, args.state_root, args.latest)
+    run = current_run(paths)
+    print(json.dumps(rte.stop_scheduler(_runtime_paths(paths, run)), ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_scheduler_serve(args: argparse.Namespace) -> int:
+    paths = discover_workspace(args.workspace, args.state_root, args.latest)
+    run = current_run(paths)
+    return rte.scheduler_loop(_runtime_paths(paths, run), str(Path(__file__).resolve()), str(paths.workspace))
+
+
+def cmd_scheduler_task_worker(args: argparse.Namespace) -> int:
+    paths = discover_workspace(args.workspace, args.state_root, args.latest)
+    run = current_run(paths)
+    return rte.task_worker(_runtime_paths(paths, run), args.task_id)
+
+
+REMOTE_CONTRACT_VERSION = 1
+REMOTE_CONTRACT_NAME = "paper-repro-remote"
+REMOTE_CONTRACT_STATUS = "frozen"
+REMOTE_CAPABILITIES = {
+    "snapshot": 1,
+    "events": 1,
+    "decisions": 1,
+    "task_registry": 1,
+    "gpu_assignment": 1,
+    "progress_adapters": 1,
+    "discover": 1,
+    "session_hint": 1,
+    "command_audit": 1,
+    # v2.1 compatibility alias. Consumers should prefer session_hint.
+    "opencode_session_hint": 1,
+}
+REMOTE_COMMAND_STATES = {"queued", "dispatched", "accepted", "completed", "failed", "expired", "cancelled"}
+REMOTE_COMMAND_TERMINAL_STATES = {"completed", "failed", "expired", "cancelled"}
+REMOTE_COMMAND_TRANSITIONS = {
+    "queued": {"queued", "dispatched", "accepted", "failed", "expired", "cancelled"},
+    "dispatched": {"dispatched", "accepted", "failed", "expired", "cancelled"},
+    "accepted": {"accepted", "completed", "failed", "cancelled"},
+    "completed": {"completed"},
+    "failed": {"failed"},
+    "expired": {"expired"},
+    "cancelled": {"cancelled"},
+}
+
+def _legacy_workspace_id(path: Path) -> str:
+    """v2.1-compatible path-derived ID, used only for first migration."""
+    return "ws-" + hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()[:12]
+
+
+def _workspace_id(paths: WorkspacePaths, *, persist: bool = True) -> str:
+    """Return the stable cross-system workspace ID.
+
+    New workspaces get a random persistent ID. Existing v2.1 workspaces are migrated
+    once from the old path-derived ID so an upgrade does not invalidate Bridge cursors.
+    After it is persisted in .paper-repro/config.json, moving the workspace does not
+    change the identity.
+    """
+    raw = read_json(paths.config, {}) or {}
+    existing = str(raw.get("workspace_id") or "").strip()
+    if re.fullmatch(r"ws-[0-9a-f]{12}", existing):
+        return existing
+    if paths.config.exists() or not persist:
+        workspace_id = _legacy_workspace_id(paths.workspace)
+    else:
+        workspace_id = "ws-" + uuid.uuid4().hex[:12]
+    if persist:
+        data = workspace_config(paths)
+        data["workspace_id"] = workspace_id
+        save_workspace_config(paths, data)
+    return workspace_id
+
+
+_REMOTE_TIME_KEYS = {
+    "generated_at", "started_at", "finished_at", "created_at", "updated_at",
+    "resolved_at", "estimated_finish_at", "ts", "stopped_at", "enabled_at",
+}
+
+
+def _rfc3339(value: Any) -> Any:
+    if not isinstance(value, str) or not value.strip():
+        return value
+    text = value.strip()
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return value
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.isoformat()
+
+
+def _remote_normalize_times(value: Any, key: str | None = None) -> Any:
+    """Normalize all remote-contract timestamps to RFC3339 with an explicit offset."""
+    if isinstance(value, dict):
+        return {k: _remote_normalize_times(v, k) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_remote_normalize_times(v, key) for v in value]
+    if key in _REMOTE_TIME_KEYS or (isinstance(key, str) and key.endswith("_at")):
+        return _rfc3339(value)
+    return value
+
+
+def _remote_print(payload: dict[str, Any]) -> None:
+    print(json.dumps(_remote_normalize_times(payload), ensure_ascii=False, indent=2))
+
+def _remote_binding(run: RunPaths, workspace: Path) -> dict[str, Any]:
+    data = read_json(run.opencode_binding, {}) or {}
+    return {
+        "session_id": data.get("session_id"),
+        "directory": data.get("directory") or str(workspace.resolve()),
+        "source": data.get("source") or "workspace-default",
+        "updated_at": data.get("updated_at"),
+        "hint_only": True,
+    }
+
+def _remote_decision_item(item: dict[str, Any], run_id: str) -> dict[str, Any]:
+    return {
+        "decision_id": item.get("decision_id"),
+        "run_id": run_id,
+        "task_id": item.get("task_id"),
+        "level": item.get("level"),
+        "stage": item.get("stage"),
+        "category": item.get("category"),
+        "impact": item.get("impact"),
+        "reversibility": item.get("reversibility"),
+        "title": item.get("title"),
+        "question": item.get("question"),
+        "options": [
+            {
+                "id": opt.get("id"),
+                "label": opt.get("label"),
+                "consequence": opt.get("consequence", ""),
+                "recommended": bool(opt.get("recommended", False)),
+            }
+            for opt in item.get("options", [])
+        ],
+        "recommended_option": item.get("recommended_option") or item.get("default_option"),
+        "allow_custom_answer": False,
+        "allow_remember": int(item.get("level", 0) or 0) < 3 and bool(item.get("preference_key")),
+        "blocking": bool(item.get("blocking", False)),
+        "state": item.get("status", "pending"),
+        "created_at": item.get("ts"),
+        "resolved_at": item.get("resolved_at"),
+        "selected_option": item.get("selected_option"),
+    }
+
+def cmd_remote_capabilities(args: argparse.Namespace) -> int:
+    payload = {
+        "schema_version": REMOTE_CONTRACT_VERSION,
+        "contract": {
+            "name": REMOTE_CONTRACT_NAME,
+            "major": 1,
+            "minor": 0,
+            "status": REMOTE_CONTRACT_STATUS,
+            "compatibility": "additive-with-capability-versioning",
+        },
+        "paper_repro_version": SYSTEM_VERSION,
+        "generated_at": now(),
+        "capabilities": dict(REMOTE_CAPABILITIES),
+        "cursor_scope": "run",
+        "id_scopes": {
+            "workspace_id": "persistent-workspace",
+            "run_id": "workspace",
+            "task_id": "run-unique-never-reused",
+            "event_id": "run-monotonic",
+            "decision_id": "run",
+            "request_id": "run",
+            "idempotency_key": "run-command-audit",
+        },
+        "truth_confidence_levels": ["high", "medium", "low", "unknown"],
+        "time_format": "RFC3339-with-offset",
+        "consumer_rules": {
+            "ignore_unknown_fields": True,
+            "field_semantics_are_stable_within_capability_major": True,
+            "capability_version_changes_before_semantic_breaks": True,
+        },
+        "deprecations": [
+            {
+                "name": "capabilities.opencode_session_hint",
+                "replacement": "capabilities.session_hint",
+                "remove_before_contract_major": 2,
+            },
+            {
+                "name": "snapshot.task_list / snapshot.gpu",
+                "replacement": "snapshot.tasks / snapshot.gpu_assignments",
+                "remove_before_contract_major": 2,
+            },
+        ],
+        "remote_write_policy": {
+            "research_decision_by_id_only": True,
+            "arbitrary_shell": False,
+            "opencode_http_proxy": False,
+            "l3_policy_bypass": False,
+            "writes_are_audited": True,
+        },
+    }
+    _remote_print(payload)
+    return 0
+
+def _remote_safe_task(task: dict[str, Any], include_command: bool = False) -> dict[str, Any]:
+    data = dict(task)
+    metadata = dict(data.get("metadata") or {})
+    data.setdefault("kind", metadata.get("kind") or "experiment")
+    data.setdefault("launcher", metadata.get("launcher"))
+    data.setdefault("worker_pids", list(metadata.get("worker_pids") or []))
+    data["startup_estimate_seconds"] = data.get("estimate_seconds")
+    progress = dict(data.get("progress") or {})
+    confidence = str(progress.get("eta_confidence") or progress.get("confidence") or "unknown")
+    if confidence not in {"high", "medium", "low", "unknown"}:
+        confidence = "unknown"
+    progress["confidence"] = confidence
+    progress.setdefault("eta_source", progress.get("eta_source"))
+    progress.setdefault("source", "unknown")
+    progress.setdefault("updated_at", data.get("updated_at"))
+    data["progress"] = progress
+    if not include_command:
+        data.pop("command", None)
+        data.pop("cwd", None)
+        data.pop("metadata", None)
+        env = dict(data.get("project_env") or {})
+        if env:
+            env.pop("prefix", None)
+            data["project_env"] = env
+    return data
+
+
+def cmd_remote_discover(args: argparse.Namespace) -> int:
+    """List registered workspaces/runs without requiring the caller to know a project path."""
+    rows: list[dict[str, Any]] = []
+    registry = load_registry().get("workspaces", {})
+    for workspace, info in registry.items():
+        state_home = Path(str(info.get("state_home", ""))).expanduser()
+        run_root = Path(str(info.get("last_run", ""))).expanduser()
+        if not state_home.exists() or not run_root.exists():
+            continue
+        state = read_json(run_root / "meta" / "state.json", {}) or {}
+        runtime_snapshot = read_json(run_root / "runtime" / "snapshot.json", {}) or {}
+        queue = runtime_snapshot.get("queue") or {}
+        scheduler = runtime_snapshot.get("scheduler") or {}
+        active = int(queue.get("active", 0) or 0)
+        queued = int(queue.get("queued", 0) or 0)
+        status = str(state.get("status", "unknown"))
+        if args.active and not (active or queued or status in {"running", "waiting-decision", "awaiting-decision", "waiting-resources", "waiting-gpu-confirmation"}):
+            continue
+        rows.append({
+            "workspace": workspace,
+            "workspace_id": str(info.get("workspace_id") or _workspace_id(WorkspacePaths(Path(workspace).resolve(), state_home), persist=False)),
+            "run_id": run_root.name,
+            "run_root": str(run_root),
+            "snapshot_path": str(run_root / "runtime" / "snapshot.json"),
+            "status": status,
+            "stage": state.get("stage"),
+            "message": state.get("message"),
+            "active_tasks": active,
+            "queued_tasks": queued,
+            "scheduler_state": scheduler.get("state"),
+            "scheduler_alive": bool(scheduler.get("alive")),
+            "updated_at": info.get("updated_at"),
+        })
+    rows.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+    payload = {"schema_version": REMOTE_CONTRACT_VERSION, "generated_at": now(), "cursor_scope": "run", "workspaces": rows}
+    _remote_print(payload)
+    return 0
+
+
+def cmd_remote_snapshot(args: argparse.Namespace) -> int:
+    paths = discover_workspace(args.workspace, args.state_root, args.latest)
+    run = current_run(paths)
+    runtime = _runtime_paths(paths, run)
+    base = status_dict(paths, include_runtime=False)
+    rt = rte.refresh_snapshot(runtime)
+    task_list = [_remote_safe_task(item, args.include_command) for item in rt.get("tasks", [])]
+    active = [item for item in task_list if item.get("state") in rte.ACTIVE_STATES]
+    queued = [item for item in task_list if item.get("state") in rte.QUEUE_STATES]
+    recent = sorted(
+        [item for item in task_list if item.get("state") in rte.TERMINAL_STATES],
+        key=lambda item: str(item.get("finished_at") or item.get("updated_at") or ""),
+        reverse=True,
+    )[:20]
+    pending = pending_decisions(run)
+    blocker_count = len([x for x in folded_issues(issue_records(run.blockers), id_field="blocker_id") if x.get("status") == "open"])
+    gpu = rt.get("gpu") or {}
+    assignments: dict[str, Any] = {}
+    for gpu_id, task_ids in (gpu.get("assignments") or {}).items():
+        ids = [str(x) for x in (task_ids or [])]
+        assignments[str(gpu_id)] = {
+            "task_id": ids[0] if len(ids) == 1 else None,
+            "task_ids": ids,
+            "role": "current-reproduction",
+            "assignment_source": "paper-repro",
+            "confidence": "high" if len(ids) <= 1 else "low",
+            "integrity": "ok" if len(ids) <= 1 else "conflict",
+            "updated_at": rt.get("generated_at") or now(),
+        }
+    pipeline = dict(base.get("pipeline") or {})
+    stage_index = pipeline.get("current_step")
+    stage_total = pipeline.get("total_steps")
+    completed_stages = pipeline.get("completed_steps")
+    pipeline_payload = {
+        "current_stage": base.get("stage"),
+        "stage_index": stage_index,
+        "stage_total": stage_total,
+        "completed_stages": completed_stages,
+        "remaining_stages": pipeline.get("remaining_steps"),
+        "percent": round((float(completed_stages or 0) / max(1.0, float(stage_total or 1))) * 100, 3),
+        "steps": pipeline.get("steps", []),
+    }
+    payload = {
+        "schema_version": REMOTE_CONTRACT_VERSION,
+        "generated_at": now(),
+        "workspace": str(paths.workspace),
+        "workspace_id": _workspace_id(paths),
+        "run": {
+            "run_id": base.get("run_id"),
+            "state": base.get("status"),
+            "started_at": base.get("started_at"),
+            "elapsed_seconds": base.get("elapsed_seconds"),
+            "message": base.get("message"),
+        },
+        "pipeline": pipeline_payload,
+        "scheduler": rt.get("scheduler") or {},
+        "queue": rt.get("queue") or {},
+        "tasks": {
+            "active": active,
+            "queued": queued,
+            "recent_completed": recent,
+        },
+        "gpu_assignments": assignments,
+        "decisions": {
+            "pending_count": len(pending),
+            "blocking_count": len([x for x in pending if x.get("blocking")]),
+        },
+        "blockers": {"active_count": blocker_count},
+        "system_issues": {"active_count": int(base.get("system_issue_count", 0) or 0)},
+        "opencode": _remote_binding(run, paths.workspace),
+        "privacy": "full" if args.include_command else "safe",
+        "contract": {
+            "name": REMOTE_CONTRACT_NAME,
+            "major": 1,
+            "minor": 0,
+            "status": REMOTE_CONTRACT_STATUS,
+            "capabilities": "paper-repro remote capabilities --json",
+            "event_cursor_scope": "run",
+        },
+        # Compatibility aliases for early v2.0 clients. New Bridge code should use the fields above.
+        "task_list": task_list,
+        "gpu": {
+            "policy": gpu.get("policy") or {},
+            "assignments": gpu.get("assignments") or {},
+        },
+    }
+    if args.include_telemetry:
+        payload["gpu_telemetry"] = gpu.get("gpus") or []
+    _remote_print(payload)
+    return 0
+
+
+def cmd_remote_events(args: argparse.Namespace) -> int:
+    paths = discover_workspace(args.workspace, args.state_root, args.latest)
+    run = current_run(paths)
+    runtime = _runtime_paths(paths, run)
+    page = rte.read_events_page(runtime, args.after or None, limit=args.limit)
+    payload = {
+        "schema_version": REMOTE_CONTRACT_VERSION,
+        "workspace_id": _workspace_id(paths),
+        "run_id": run.root.name,
+        "cursor_scope": "run",
+        **page,
+    }
+    _remote_print(payload)
+    return 0
+
+
+def cmd_remote_decisions(args: argparse.Namespace) -> int:
+    paths = discover_workspace(args.workspace, args.state_root, args.latest)
+    run = current_run(paths)
+    items = pending_decisions(run)
+    payload = {
+        "schema_version": REMOTE_CONTRACT_VERSION,
+        "workspace_id": _workspace_id(paths),
+        "run_id": run.root.name,
+        "decisions": [_remote_decision_item(item, run.root.name) for item in items],
+    }
+    _remote_print(payload)
+    return 0
+
+
+def cmd_remote_decide(args: argparse.Namespace) -> int:
+    paths = discover_workspace(args.workspace, args.state_root, args.latest)
+    run = current_run(paths)
+    runtime = _runtime_paths(paths, run)
+    workspace_id = _workspace_id(paths)
+    resolution_record = None
+    with rte.runtime_lock(runtime):
+        items = {item.get("decision_id"): item for item in folded_decisions(decision_records(run.decisions))}
+        item = items.get(args.decision_id)
+        if not item:
+            _remote_print({
+                "ok": False, "code": "decision_not_found", "decision_id": args.decision_id,
+                "workspace_id": workspace_id, "run_id": run.root.name, "state": "not_found",
+            })
+            return 2
+        if item.get("status") != "pending":
+            selected = item.get("selected_option")
+            same = selected == args.option
+            _remote_print({
+                "ok": bool(same),
+                "code": "already_resolved",
+                "decision_id": args.decision_id,
+                "workspace_id": workspace_id,
+                "run_id": run.root.name,
+                "resolved_option": selected,
+                "requested_option": args.option,
+                # v2.1 aliases retained for Contract v1 compatibility.
+                "selected": selected,
+                "requested": args.option,
+                "state": "already_resolved",
+                "resolved_at": item.get("resolved_at"),
+                "conflict": not same,
+            })
+            return 0 if same else 4
+        option_ids = {option.get("id") for option in item.get("options", [])}
+        if args.option not in option_ids:
+            _remote_print({
+                "ok": False, "code": "invalid_option", "decision_id": args.decision_id,
+                "workspace_id": workspace_id, "run_id": run.root.name, "state": "invalid_option",
+                "requested_option": args.option, "allowed_options": sorted(str(x) for x in option_ids),
+            })
+            return 2
+        resolution_record = {
+            "ts": now(), "action": "resolved", "decision_id": args.decision_id, "status": "resolved",
+            "selected_option": args.option, "resolution_note": args.note, "remember_scope": args.remember,
+            "user_involved": True, "resolution_source": "remote-bridge",
+        }
+        append_jsonl(run.decisions, resolution_record)
+    preference_key = item.get("preference_key")
+    if args.remember != "none" and preference_key and int(item.get("level", 0) or 0) < 3:
+        save_decision_preference(paths, str(preference_key), args.option, args.remember)
+    remaining = pending_decisions(run, blocking_only=True)
+    update_state(
+        run,
+        status="awaiting-decision" if remaining else "running",
+        message=(f"仍有 {len(remaining)} 项决策待确认" if remaining else "决策已确认，可以继续执行"),
+        pending_decision_count=len(remaining),
+    )
+    atomic_json(run.decision_checkpoint, {"generated_at": now(), "stage": item.get("stage", ""), "pending": remaining})
+    render_decisions_markdown(run)
+    event(run, "decision.resolved", decision_id=args.decision_id, selected_option=args.option, remember=args.remember, source="remote-bridge")
+    rte.emit_event(runtime, "decision.resolved", data={
+        "decision_id": args.decision_id, "selected_option": args.option, "remember": args.remember, "source": "remote-bridge",
+    })
+    _remote_print({
+        "ok": True, "code": "resolved", "decision_id": args.decision_id,
+        "workspace_id": workspace_id, "run_id": run.root.name,
+        "selected_option": args.option, "resolved_option": args.option, "selected": args.option,
+        "state": "resolved", "resolved_at": resolution_record.get("ts") if resolution_record else now(),
+        "remaining_pending": len(remaining),
+    })
+    return 0
+
+def cmd_remote_session_show(args: argparse.Namespace) -> int:
+    paths = discover_workspace(args.workspace, args.state_root, args.latest)
+    run = current_run(paths)
+    _remote_print({
+        "schema_version": REMOTE_CONTRACT_VERSION,
+        "workspace_id": _workspace_id(paths),
+        "run_id": run.root.name,
+        "opencode": _remote_binding(run, paths.workspace),
+    })
+    return 0
+
+
+def cmd_remote_session_bind(args: argparse.Namespace) -> int:
+    paths = discover_workspace(args.workspace, args.state_root, args.latest)
+    run = current_run(paths)
+    directory = str(Path(args.directory or paths.workspace).expanduser().resolve())
+    payload = {
+        "schema_version": REMOTE_CONTRACT_VERSION,
+        "session_id": args.session_id or None,
+        "directory": directory,
+        "source": args.source or "remote-bridge",
+        "updated_at": now(),
+        "hint_only": True,
+    }
+    atomic_json(run.opencode_binding, payload)
+    try:
+        os.chmod(run.opencode_binding, 0o600)
+    except OSError:
+        pass
+    rte.emit_event(_runtime_paths(paths, run), "opencode.binding_updated", data={
+        "session_id": payload.get("session_id"), "directory": directory, "source": payload.get("source"),
+    })
+    _remote_print({"ok": True, "workspace_id": _workspace_id(paths), "run_id": run.root.name, "opencode": payload})
+    return 0
+
+
+def cmd_remote_session_clear(args: argparse.Namespace) -> int:
+    paths = discover_workspace(args.workspace, args.state_root, args.latest)
+    run = current_run(paths)
+    run.opencode_binding.unlink(missing_ok=True)
+    rte.emit_event(_runtime_paths(paths, run), "opencode.binding_cleared", data={})
+    _remote_print({"ok": True, "workspace_id": _workspace_id(paths), "run_id": run.root.name, "state": "cleared"})
+    return 0
+
+
+def _fold_remote_commands(path: Path) -> list[dict[str, Any]]:
+    folded: dict[str, dict[str, Any]] = {}
+    if not path.exists():
+        return []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        req = str(rec.get("request_id") or "")
+        if not req:
+            continue
+        current = folded.setdefault(req, {})
+        current.update(rec)
+    return sorted(folded.values(), key=lambda x: str(x.get("updated_at") or x.get("created_at") or ""), reverse=True)
+
+def cmd_remote_command_record(args: argparse.Namespace) -> int:
+    paths = discover_workspace(args.workspace, args.state_root, args.latest)
+    run = current_run(paths)
+    runtime = _runtime_paths(paths, run)
+    workspace_id = _workspace_id(paths)
+    with rte.runtime_lock(runtime):
+        folded = _fold_remote_commands(run.remote_commands)
+        existing = {x.get("request_id"): x for x in folded}
+        prior = existing.get(args.request_id)
+        if args.idempotency_key:
+            for rec in folded:
+                if rec.get("idempotency_key") == args.idempotency_key and rec.get("request_id") != args.request_id:
+                    _remote_print({
+                        "ok": False, "code": "idempotency_conflict", "request_id": args.request_id,
+                        "existing_request_id": rec.get("request_id"), "state": "idempotency_conflict",
+                        "workspace_id": workspace_id, "run_id": run.root.name,
+                    })
+                    return 4
+        if prior and args.idempotency_key and prior.get("idempotency_key") not in {None, "", args.idempotency_key}:
+            _remote_print({
+                "ok": False, "code": "idempotency_conflict", "request_id": args.request_id,
+                "state": "idempotency_conflict", "workspace_id": workspace_id, "run_id": run.root.name,
+            })
+            return 4
+        if prior and (prior.get("target") != args.target or prior.get("type") != args.command_type):
+            _remote_print({
+                "ok": False, "code": "request_identity_conflict", "request_id": args.request_id,
+                "state": "request_identity_conflict", "workspace_id": workspace_id, "run_id": run.root.name,
+            })
+            return 4
+        prior_state = str(prior.get("state") or "") if prior else ""
+        if prior_state and args.state not in REMOTE_COMMAND_TRANSITIONS.get(prior_state, {prior_state}):
+            _remote_print({
+                "ok": False, "code": "invalid_state_transition", "request_id": args.request_id,
+                "previous_state": prior_state, "requested_state": args.state,
+                "state": "invalid_state_transition", "workspace_id": workspace_id, "run_id": run.root.name,
+            })
+            return 4
+        record = {
+            "schema_version": REMOTE_CONTRACT_VERSION,
+            "request_id": args.request_id,
+            "workspace_id": workspace_id,
+            "run_id": run.root.name,
+            "target": args.target,
+            "type": args.command_type,
+            "session_id": args.session_id or None,
+            "state": args.state,
+            "requires_idle": bool(args.requires_idle),
+            "priority": args.priority,
+            "ttl_seconds": args.ttl_seconds,
+            "idempotency_key": args.idempotency_key or None,
+            "summary": redact(args.summary or ""),
+            "payload_sha256": args.payload_sha256 or None,
+            "created_at": prior.get("created_at") if prior else now(),
+            "updated_at": now(),
+            "source": "remote-bridge",
+        }
+        append_jsonl(run.remote_commands, record)
+    try:
+        os.chmod(run.remote_commands, 0o600)
+    except OSError:
+        pass
+    rte.emit_event(runtime, f"remote.command.{args.state}", data={
+        "request_id": args.request_id, "target": args.target, "type": args.command_type,
+        "session_id": args.session_id or None, "idempotency_key": args.idempotency_key or None,
+    })
+    _remote_print({"ok": True, "code": "recorded", **record})
+    return 0
+
+def cmd_remote_command_list(args: argparse.Namespace) -> int:
+    paths = discover_workspace(args.workspace, args.state_root, args.latest)
+    run = current_run(paths)
+    workspace_id = _workspace_id(paths)
+    items = _fold_remote_commands(run.remote_commands)
+    for item in items:
+        item.setdefault("schema_version", REMOTE_CONTRACT_VERSION)
+        item.setdefault("workspace_id", workspace_id)
+        item.setdefault("run_id", run.root.name)
+    if args.state:
+        items = [x for x in items if x.get("state") == args.state]
+    _remote_print({
+        "schema_version": REMOTE_CONTRACT_VERSION, "workspace_id": workspace_id,
+        "run_id": run.root.name, "commands": items[:args.limit],
+    })
     return 0
 
 def cmd_stage(args: argparse.Namespace) -> int:
@@ -3289,6 +4501,13 @@ def cmd_stage(args: argparse.Namespace) -> int:
         changes["eta_seconds"] = args.eta
     update_state(run, **changes)
     event(run, "stage.updated", **changes)
+    rte.emit_event(_runtime_paths(paths, run), "run.stage_changed", data={
+        "stage": args.stage, "status": args.status, "step": args.step, "step_total": args.step_total,
+    })
+    if args.status == "completed" and int((pipeline or {}).get("completed_steps", 0) or 0) >= int((pipeline or {}).get("total_steps", 8) or 8):
+        rte.emit_event(_runtime_paths(paths, run), "run.completed", data={"stage": args.stage})
+    elif args.status == "failed":
+        rte.emit_event(_runtime_paths(paths, run), "run.failed", data={"stage": args.stage, "message": args.message})
     print(json.dumps(status_dict(paths), ensure_ascii=False, indent=2))
     return 0
 
@@ -3403,6 +4622,143 @@ def cmd_env_clear(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_security_show(args: argparse.Namespace) -> int:
+    paths = discover_workspace(args.workspace, args.state_root, args.latest)
+    policy = execution_security_policy(paths)
+    payload = {
+        "workspace": str(paths.workspace),
+        "policy": policy,
+        "sandbox_backend": rte.sandbox_backend_status(),
+        "allowed_download_roots_effective": [str(x) for x in allowed_download_roots(paths)],
+        "note": "auto/required sandbox modes fail closed when bwrap is unavailable; trusted-off is an explicit trusted-repository escape hatch.",
+    }
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_security_sandbox_set(args: argparse.Namespace) -> int:
+    paths = discover_workspace(args.workspace, args.state_root, args.latest)
+    if args.mode == "trusted-off" and not args.yes:
+        raise ReproError("trusted-off disables OS-level project sandboxing; repeat with --yes only for a repository you trust")
+    config = workspace_config(paths)
+    security = config.setdefault("execution_security", {})
+    security["sandbox"] = {"mode": args.mode, "backend": "auto", "network": args.network}
+    save_workspace_config(paths, config)
+    print(json.dumps({"sandbox": security["sandbox"], "backend_status": rte.sandbox_backend_status()}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_security_secret_allow(args: argparse.Namespace) -> int:
+    if not args.yes:
+        raise ReproError("Task secret access is sensitive; repeat with --yes after reviewing the target repository")
+    if not SECRET_NAME_RE.fullmatch(args.name):
+        raise ReproError(f"Invalid secret env name: {args.name}")
+    paths = discover_workspace(args.workspace, args.state_root, args.latest)
+    config = workspace_config(paths)
+    security = config.setdefault("execution_security", {})
+    names = sorted(set(str(x) for x in security.get("allowed_secret_env", [])) | {args.name})
+    security["allowed_secret_env"] = names
+    save_workspace_config(paths, config)
+    print(json.dumps({"allowed_secret_env": names}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_security_secret_revoke(args: argparse.Namespace) -> int:
+    paths = discover_workspace(args.workspace, args.state_root, args.latest)
+    config = workspace_config(paths)
+    security = config.setdefault("execution_security", {})
+    names = [str(x) for x in security.get("allowed_secret_env", []) if str(x) != args.name]
+    security["allowed_secret_env"] = names
+    save_workspace_config(paths, config)
+    print(json.dumps({"allowed_secret_env": names}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_security_download_root_add(args: argparse.Namespace) -> int:
+    if not args.yes:
+        raise ReproError("External download roots expand the project write boundary; repeat with --yes")
+    paths = discover_workspace(args.workspace, args.state_root, args.latest)
+    root = Path(args.path).expanduser().resolve()
+    home = Path.home().resolve()
+    sensitive_candidates = [
+        home,
+        Path(os.environ.get("PAPER_REPRO_CONFIG_HOME", str(home / ".config" / "paper-repro"))).expanduser().resolve(),
+        Path(os.environ.get("PAPER_REPRO_CONFIG_FILE", str(home / ".config" / "paper-repro" / "config.json"))).expanduser().resolve(),
+        home / ".ssh", home / ".aws", home / ".config" / "gcloud",
+    ]
+    if str(root) == "/" or root == home or any(_path_within(candidate, root) for candidate in sensitive_candidates):
+        raise ReproError("Refusing overly broad/sensitive download root; choose a dedicated data/model directory")
+    config = workspace_config(paths)
+    security = config.setdefault("execution_security", {})
+    roots = sorted(set(str(x) for x in security.get("allowed_download_roots", [])) | {str(root)})
+    security["allowed_download_roots"] = roots
+    save_workspace_config(paths, config)
+    print(json.dumps({"allowed_download_roots": roots}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_security_download_root_remove(args: argparse.Namespace) -> int:
+    paths = discover_workspace(args.workspace, args.state_root, args.latest)
+    root = str(Path(args.path).expanduser().resolve())
+    config = workspace_config(paths)
+    security = config.setdefault("execution_security", {})
+    roots = [str(x) for x in security.get("allowed_download_roots", []) if str(x) != root]
+    security["allowed_download_roots"] = roots
+    save_workspace_config(paths, config)
+    print(json.dumps({"allowed_download_roots": roots}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _repair_private_tree(root: Path) -> dict[str, int]:
+    counts = {"directories": 0, "files": 0, "symlinks_skipped": 0}
+    if not root.exists():
+        return counts
+    if root.is_symlink():
+        raise ReproError(f"Refusing to repair permissions through symlink root: {root}")
+    root.chmod(0o700)
+    counts["directories"] += 1
+    for current, dirs, files in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        safe_dirs = []
+        for name in dirs:
+            target = current_path / name
+            if target.is_symlink():
+                counts["symlinks_skipped"] += 1
+                continue
+            target.chmod(0o700)
+            counts["directories"] += 1
+            safe_dirs.append(name)
+        dirs[:] = safe_dirs
+        for name in files:
+            target = current_path / name
+            if target.is_symlink():
+                counts["symlinks_skipped"] += 1
+                continue
+            target.chmod(0o600)
+            counts["files"] += 1
+    return counts
+
+
+def cmd_security_permissions_repair(args: argparse.Namespace) -> int:
+    if not args.yes:
+        raise ReproError("Permission repair changes state/config modes to private 700/600; repeat with --yes")
+    paths = discover_workspace(args.workspace, args.state_root, args.latest)
+    payload: dict[str, Any] = {"scope": args.scope, "workspace": str(paths.workspace), "repaired": {}}
+    if args.scope in {"workspace", "all"}:
+        payload["repaired"]["workspace_state"] = {
+            "path": str(paths.state_home),
+            **_repair_private_tree(paths.state_home),
+        }
+    if args.scope in {"global", "all"}:
+        global_root = PAPER_REPRO_CONFIG_HOME.resolve()
+        payload["repaired"]["global_config"] = {
+            "path": str(global_root),
+            **_repair_private_tree(global_root),
+        }
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_download(args: argparse.Namespace) -> int:
     try:
         import requests
@@ -3416,7 +4772,15 @@ def cmd_download(args: argparse.Namespace) -> int:
     output = Path(args.output).expanduser()
     if not output.is_absolute():
         output = (paths.workspace / output).resolve()
-    output.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        output = output.resolve()
+    roots = allowed_download_roots(paths)
+    if not any(_path_within(output, root) for root in roots):
+        raise ReproError(
+            f"下载输出越过允许目录：{output}. 允许目录：{[str(x) for x in roots]}. "
+            "如确有需要，先由用户执行 paper-repro security download-root add /path --yes"
+        )
+    output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     existing = output.stat().st_size if output.exists() and args.resume else 0
     headers = {"User-Agent": f"paper-repro/{SYSTEM_VERSION}"}
     if existing:
@@ -3644,6 +5008,12 @@ def doctor_checks(paths: WorkspacePaths) -> list[dict[str, Any]]:
     secrets_permissions = oct(SECRETS_FILE.stat().st_mode & 0o777) if SECRETS_FILE.exists() else "not created"
     add("persistent_secrets_file", True, str(SECRETS_FILE), "Use paper-repro secrets init/set to persist API and MCP tokens")
     add("persistent_secrets_permissions", not SECRETS_FILE.exists() or (SECRETS_FILE.stat().st_mode & 0o077) == 0, secrets_permissions, "Run chmod 600 on the secrets file")
+    sec_policy = execution_security_policy(paths)
+    sandbox_policy = dict(sec_policy.get("sandbox") or {})
+    sandbox_status = rte.sandbox_backend_status()
+    sandbox_ok = str(sandbox_policy.get("mode", "auto")) == "trusted-off" or bool(sandbox_status.get("available"))
+    add("execution_sandbox", sandbox_ok, {"policy": sandbox_policy, "backend": sandbox_status}, "Install bubblewrap/bwrap, or explicitly use trusted-off only for reviewed repositories")
+    add("task_secret_default_deny", len(sec_policy.get("allowed_secret_env", [])) == 0, list(sec_policy.get("allowed_secret_env", [])), "Keep task secret allowlist empty unless a specific experiment requires a credential")
     add("workspace_writable", os.access(paths.workspace, os.W_OK), str(paths.workspace), "Choose a writable project directory")
     add("git_workspace", git_root(paths.workspace) is not None, str(git_root(paths.workspace) or "not a Git repository"), "Launch OpenCode in the target repository root")
     add("nvidia_smi", shutil.which("nvidia-smi") is not None, shutil.which("nvidia-smi") or "missing", "GPU runs require a host NVIDIA driver")
@@ -3790,6 +5160,9 @@ def cmd_blocker_resolve(args: argparse.Namespace) -> int:
     }
     append_jsonl(run.blockers, resolution)
     render_issue_markdown(run.report / "RUN_BLOCKERS.md", "本次论文复现阻塞项", issue_records(run.blockers), kind="blocker")
+    rte.emit_event(_runtime_paths(paths, run), "blocker.resolved", data={
+        "blocker_id": args.blocker_id, "resolution": redact(args.resolution or ""),
+    })
     print(json.dumps(resolution, ensure_ascii=False, indent=2))
     return 0
 
@@ -4352,7 +5725,9 @@ def _test_improvement(improvement_id: str) -> dict[str, Any]:
     if not source.exists():
         raise ReproError("请先 prepare 自我迭代任务")
     tests: list[dict[str, Any]] = []
-    tests.append(_run_capture([sys.executable, "-m", "py_compile", "scripts/reproctl.py"], source, 120))
+    compile_targets = ["scripts/security.py", "scripts/runtime_engine.py", "scripts/reproctl.py"]
+    existing_compile_targets = [item for item in compile_targets if (source / item).exists()]
+    tests.append(_run_capture([sys.executable, "-m", "py_compile", *existing_compile_targets], source, 120))
     for script in ["bootstrap.sh", "scripts/uninstall.sh", "tests/smoke_test.sh"]:
         if (source / script).exists():
             tests.append(_run_capture(["bash", "-n", script], source, 60))
@@ -4374,6 +5749,12 @@ def _test_improvement(improvement_id: str) -> dict[str, Any]:
         "passed": not secret_findings,
     })
     policy = self_improvement_policy()
+    # Remote Contract v1 is a frozen cross-repository compatibility boundary.
+    # Any self-iteration that touches remote/runtime behavior must pass these gates
+    # before the broader smoke suite is allowed to approve a patch.
+    for contract_test in ["tests/remote_contract_test.py", "tests/runtime_engine_test.py", "tests/security_hardening_test.py"]:
+        if (source / contract_test).exists():
+            tests.append(_run_capture([sys.executable, contract_test], source, 180))
     smoke = source / "tests/smoke_test.sh"
     if policy.get("require_smoke_tests", True) and smoke.exists():
         env = {**os.environ, "PAPER_REPRO_SELF_TEST": "1"}
@@ -4994,12 +6375,14 @@ def _copy_public_source(source: Path, destination: Path) -> list[str]:
         if not src.exists():
             continue
         dst = destination / name
-        if src.is_symlink():
-            raise ReproError(f"源码快照包含符号链接，拒绝发布：{name}")
+        links = sec.find_symlinks(src)
+        if links:
+            sample = [str(item.relative_to(source)) for item in links[:10]]
+            raise ReproError(f"源码快照包含符号链接，发布 fail-closed：{sample}")
         if src.is_dir():
             shutil.copytree(
                 src, dst,
-                symlinks=False,
+                symlinks=True,
                 ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc", "*.zip", ".paper-repro", "runs", "dist"),
             )
         else:
@@ -5778,7 +7161,7 @@ def build_parser() -> argparse.ArgumentParser:
     command.add_argument("--command", required=True)
     command.add_argument("--timeout", type=int, default=86400)
     command.add_argument("--estimate", type=int, default=0)
-    command.add_argument("--gpus", default=None, help="GPU 分配：auto（默认，选最空闲卡）/ all / none / 显式列表如 0,1；未指定时使用 config.json execution_env.gpus_default")
+    command.add_argument("--secret-env", action="append", default=[], help="Task-scoped secret env; must be explicitly authorized by workspace security policy")
     command.set_defaults(func=cmd_exec)
 
     command = sub.add_parser("download", help="Download a large HTTP(S) asset with resume, progress, speed and ETA")
@@ -5805,6 +7188,168 @@ def build_parser() -> argparse.ArgumentParser:
     command.add_argument("--interval", type=float, default=3.0)
     command.set_defaults(func=cmd_status)
 
+
+    gpu = sub.add_parser("gpu", help="Inspect and confirm the GPU pool available to this reproduction run")
+    gpu_sub = gpu.add_subparsers(dest="gpu_cmd", required=True)
+    gpu_prepare = gpu_sub.add_parser("prepare", help="Return detected GPUs and whether this run needs user confirmation")
+    gpu_prepare.add_argument("--json", action="store_true")
+    gpu_prepare.set_defaults(func=cmd_gpu_prepare)
+    gpu_inspect = gpu_sub.add_parser("inspect", help="Show raw GPU telemetry plus paper-repro assignment state")
+    gpu_inspect.add_argument("--json", action="store_true")
+    gpu_inspect.set_defaults(func=cmd_gpu_inspect)
+    gpu_show = gpu_sub.add_parser("show", help="Show run GPU policy, workspace defaults and telemetry")
+    gpu_show.set_defaults(func=cmd_gpu_show)
+    gpu_configure = gpu_sub.add_parser("configure", help="Confirm which physical GPUs paper-repro may schedule for this run")
+    gpu_configure.add_argument("--ids", default="", help="Comma-separated physical GPU IDs, or none for CPU-only")
+    gpu_configure.add_argument("--interactive", action="store_true")
+    gpu_configure.add_argument("--remember-workspace", action="store_true", help="Remember the selection as the suggestion for future runs; each run still confirms")
+    gpu_configure.add_argument("--max-parallel", type=int)
+    gpu_configure.add_argument("--cpu-parallel", type=int, default=1)
+    gpu_configure.add_argument("--external-busy-memory-mb", type=int)
+    gpu_configure.add_argument("--external-busy-util-pct", type=int)
+    gpu_configure.add_argument("--allow-external-busy", action="store_true", help="Allow scheduling onto GPUs that appear busy from external workloads")
+    gpu_configure.add_argument("--allow-missing", action="store_true", help="Record IDs that are not currently visible (advanced/debug only)")
+    gpu_configure.set_defaults(func=cmd_gpu_configure)
+
+    runtime = sub.add_parser("runtime", help="Persistent task registry, execution plans, progress, ETA and machine-readable runtime state")
+    runtime_sub = runtime.add_subparsers(dest="runtime_cmd", required=True)
+    rt_submit = runtime_sub.add_parser("submit", help="Submit one task to the persistent scheduler and return immediately")
+    rt_submit.add_argument("--name", required=True)
+    rt_submit.add_argument("--stage", default="execution")
+    rt_submit.add_argument("--command", required=True)
+    rt_submit.add_argument("--timeout", type=int, default=86400)
+    rt_submit.add_argument("--estimate", type=int, default=0)
+    rt_submit.add_argument("--gpu-count", type=int, required=True, help="0 for CPU, 1 for single GPU, N for a multi-GPU job")
+    rt_submit.add_argument("--gpu-ids", default="", help="Optional preferred physical GPU IDs")
+    rt_submit.add_argument("--min-free-memory-mb", type=int, default=0)
+    rt_submit.add_argument("--priority", type=int, default=0)
+    rt_submit.add_argument("--depends-on", action="append", default=[], help="Task ID dependency; repeatable")
+    rt_submit.add_argument("--parallel-group", default="")
+    rt_submit.add_argument("--progress-adapter", default='{"type":"auto"}', help="JSON: auto/native/tqdm/jsonl-line-count/line-count/file-count/regex-log")
+    rt_submit.add_argument("--output", action="append", default=[])
+    rt_submit.add_argument("--secret-env", action="append", default=[], help="Task-scoped secret env; must be explicitly authorized by workspace security policy")
+    rt_submit.add_argument("--start-scheduler", action=argparse.BooleanOptionalAction, default=True)
+    rt_submit.set_defaults(func=cmd_runtime_submit)
+    rt_status = runtime_sub.add_parser("status", help="Stable machine-readable runtime status")
+    rt_status.add_argument("--json", action="store_true")
+    rt_status.set_defaults(func=cmd_runtime_status)
+    rt_tasks = runtime_sub.add_parser("tasks", help="List registered tasks")
+    rt_tasks.add_argument("--active", action="store_true")
+    rt_tasks.add_argument("--pending", action="store_true")
+    rt_tasks.add_argument("--json", action="store_true")
+    rt_tasks.set_defaults(func=cmd_runtime_tasks)
+    rt_task = runtime_sub.add_parser("task", help="Show one registered task")
+    rt_task.add_argument("task_id")
+    rt_task.add_argument("--json", action="store_true")
+    rt_task.set_defaults(func=cmd_runtime_task)
+    rt_gpu = runtime_sub.add_parser("gpu", help="Show GPU to task mapping")
+    rt_gpu.add_argument("--json", action="store_true")
+    rt_gpu.set_defaults(func=cmd_runtime_gpu)
+    rt_events = runtime_sub.add_parser("events", help="Read incremental runtime events")
+    rt_events.add_argument("--after", default="")
+    rt_events.add_argument("--limit", type=int, default=500)
+    rt_events.add_argument("--json", action="store_true")
+    rt_events.set_defaults(func=cmd_runtime_events)
+    rt_cancel = runtime_sub.add_parser("cancel", help="Cancel a queued/running task")
+    rt_cancel.add_argument("task_id")
+    rt_cancel.set_defaults(func=cmd_runtime_cancel)
+    rt_retry = runtime_sub.add_parser("retry", help="Requeue a terminal task")
+    rt_retry.add_argument("task_id")
+    rt_retry.set_defaults(func=cmd_runtime_retry)
+    rt_plan = runtime_sub.add_parser("plan", help="Create/show/submit a multi-task execution plan")
+    rt_plan_sub = rt_plan.add_subparsers(dest="runtime_plan_cmd", required=True)
+    rt_plan_save = rt_plan_sub.add_parser("save")
+    rt_plan_save.add_argument("--file", default="")
+    rt_plan_save.add_argument("--tasks-json", default="")
+    rt_plan_save.set_defaults(func=cmd_runtime_plan_save)
+    rt_plan_show = rt_plan_sub.add_parser("show")
+    rt_plan_show.set_defaults(func=cmd_runtime_plan_show)
+    rt_plan_submit = rt_plan_sub.add_parser("submit")
+    rt_plan_submit.add_argument("--file", default="")
+    rt_plan_submit.add_argument("--tasks-json", default="")
+    rt_plan_submit.set_defaults(func=cmd_runtime_plan_submit)
+
+    scheduler = sub.add_parser("scheduler", help="Persistent queue scheduler independent from the OpenCode agent session")
+    scheduler_sub = scheduler.add_subparsers(dest="scheduler_cmd", required=True)
+    scheduler_start = scheduler_sub.add_parser("start")
+    scheduler_start.set_defaults(func=cmd_scheduler_start)
+    scheduler_status = scheduler_sub.add_parser("status")
+    scheduler_status.set_defaults(func=cmd_scheduler_status)
+    scheduler_stop = scheduler_sub.add_parser("stop")
+    scheduler_stop.set_defaults(func=cmd_scheduler_stop)
+    scheduler_serve = scheduler_sub.add_parser("serve", help=argparse.SUPPRESS)
+    scheduler_serve.set_defaults(func=cmd_scheduler_serve)
+    scheduler_worker = scheduler_sub.add_parser("task-worker", help=argparse.SUPPRESS)
+    scheduler_worker.add_argument("task_id")
+    scheduler_worker.set_defaults(func=cmd_scheduler_task_worker)
+
+    remote = sub.add_parser("remote", help="Stable JSON contract for Remote Bridge / WorkBuddy and other remote clients")
+    remote_sub = remote.add_subparsers(dest="remote_cmd", required=True)
+    remote_capabilities = remote_sub.add_parser("capabilities", help="Feature handshake for remote clients; do not infer features from version strings")
+    remote_capabilities.add_argument("--json", action="store_true")
+    remote_capabilities.set_defaults(func=cmd_remote_capabilities)
+    remote_discover = remote_sub.add_parser("discover", help="List registered workspaces/runs for remote clients")
+    remote_discover.add_argument("--active", action="store_true", help="Show only active/waiting runs")
+    remote_discover.add_argument("--json", action="store_true")
+    remote_discover.set_defaults(func=cmd_remote_discover)
+    remote_snapshot = remote_sub.add_parser("snapshot")
+    remote_snapshot.add_argument("--json", action="store_true")
+    remote_snapshot.add_argument("--include-command", action="store_true", help="Include task command/cwd; safe mode omits them")
+    remote_snapshot.add_argument("--include-telemetry", action="store_true", help="Include nvidia-smi-style raw telemetry; Bridge normally collects telemetry itself")
+    remote_snapshot.set_defaults(func=cmd_remote_snapshot)
+    remote_events = remote_sub.add_parser("events")
+    remote_events.add_argument("--after", default="")
+    remote_events.add_argument("--limit", type=int, default=500)
+    remote_events.add_argument("--json", action="store_true")
+    remote_events.set_defaults(func=cmd_remote_events)
+    remote_decisions = remote_sub.add_parser("decisions")
+    remote_decisions.add_argument("--json", action="store_true")
+    remote_decisions.set_defaults(func=cmd_remote_decisions)
+    remote_decide = remote_sub.add_parser("decide")
+    remote_decide.add_argument("decision_id")
+    remote_decide.add_argument("option")
+    remote_decide.add_argument("--remember", choices=["none", "workspace", "global"], default="none")
+    remote_decide.add_argument("--note", default="")
+    remote_decide.add_argument("--json", action="store_true")
+    remote_decide.set_defaults(func=cmd_remote_decide)
+
+    remote_session = remote_sub.add_parser("session", help="Optional OpenCode session/directory hint; Bridge still feature-detects and selects the live session")
+    remote_session_sub = remote_session.add_subparsers(dest="remote_session_cmd", required=True)
+    remote_session_show = remote_session_sub.add_parser("show")
+    remote_session_show.add_argument("--json", action="store_true")
+    remote_session_show.set_defaults(func=cmd_remote_session_show)
+    remote_session_bind = remote_session_sub.add_parser("bind")
+    remote_session_bind.add_argument("--session-id", default="")
+    remote_session_bind.add_argument("--directory", default="")
+    remote_session_bind.add_argument("--source", default="remote-bridge")
+    remote_session_bind.add_argument("--json", action="store_true")
+    remote_session_bind.set_defaults(func=cmd_remote_session_bind)
+    remote_session_clear = remote_session_sub.add_parser("clear")
+    remote_session_clear.add_argument("--json", action="store_true")
+    remote_session_clear.set_defaults(func=cmd_remote_session_clear)
+
+    remote_command = remote_sub.add_parser("command", help="Audit metadata for Bridge -> OpenCode writes; paper-repro does not dispatch OpenCode HTTP")
+    remote_command_sub = remote_command.add_subparsers(dest="remote_command_cmd", required=True)
+    remote_command_record = remote_command_sub.add_parser("record")
+    remote_command_record.add_argument("--request-id", required=True)
+    remote_command_record.add_argument("--target", choices=["opencode", "paper-repro"], default="opencode")
+    remote_command_record.add_argument("--type", dest="command_type", choices=["prompt", "slash-command", "permission", "question", "decision", "diagnostic"], required=True)
+    remote_command_record.add_argument("--session-id", default="")
+    remote_command_record.add_argument("--state", choices=["queued", "dispatched", "accepted", "completed", "failed", "expired", "cancelled"], required=True)
+    remote_command_record.add_argument("--requires-idle", action="store_true")
+    remote_command_record.add_argument("--priority", choices=["low", "normal", "high"], default="normal")
+    remote_command_record.add_argument("--ttl-seconds", type=int, default=3600)
+    remote_command_record.add_argument("--idempotency-key", default="")
+    remote_command_record.add_argument("--summary", default="", help="Redacted human-readable summary only; do not pass secrets/full prompts")
+    remote_command_record.add_argument("--payload-sha256", default="", help="Optional hash of the Bridge payload for audit/correlation")
+    remote_command_record.add_argument("--json", action="store_true")
+    remote_command_record.set_defaults(func=cmd_remote_command_record)
+    remote_command_list = remote_command_sub.add_parser("list")
+    remote_command_list.add_argument("--state", choices=["queued", "dispatched", "accepted", "completed", "failed", "expired", "cancelled"], default="")
+    remote_command_list.add_argument("--limit", type=int, default=100)
+    remote_command_list.add_argument("--json", action="store_true")
+    remote_command_list.set_defaults(func=cmd_remote_command_list)
+
     command = sub.add_parser("stage", help="Update structured stage state")
     command.add_argument("--stage", required=True)
     command.add_argument("--status", default="running")
@@ -5816,6 +7361,42 @@ def build_parser() -> argparse.ArgumentParser:
     command.add_argument("--step-name", default="", help="Human-readable step name")
     command.add_argument("--step-status", choices=["pending", "running", "completed", "failed", "blocked"])
     command.set_defaults(func=cmd_stage)
+
+    security = sub.add_parser("security", help="Inspect and configure execution security boundaries")
+    security_sub = security.add_subparsers(dest="security_cmd", required=True)
+    sec_show = security_sub.add_parser("show")
+    sec_show.set_defaults(func=cmd_security_show)
+    sec_sandbox = security_sub.add_parser("sandbox")
+    sec_sandbox_sub = sec_sandbox.add_subparsers(dest="security_sandbox_cmd", required=True)
+    sec_sandbox_set = sec_sandbox_sub.add_parser("set")
+    sec_sandbox_set.add_argument("--mode", choices=["auto", "required", "trusted-off"], required=True)
+    sec_sandbox_set.add_argument("--network", choices=["on", "off"], default="on")
+    sec_sandbox_set.add_argument("--yes", action="store_true")
+    sec_sandbox_set.set_defaults(func=cmd_security_sandbox_set)
+    sec_secret = security_sub.add_parser("secret")
+    sec_secret_sub = sec_secret.add_subparsers(dest="security_secret_cmd", required=True)
+    sec_secret_allow = sec_secret_sub.add_parser("allow")
+    sec_secret_allow.add_argument("name")
+    sec_secret_allow.add_argument("--yes", action="store_true")
+    sec_secret_allow.set_defaults(func=cmd_security_secret_allow)
+    sec_secret_revoke = sec_secret_sub.add_parser("revoke")
+    sec_secret_revoke.add_argument("name")
+    sec_secret_revoke.set_defaults(func=cmd_security_secret_revoke)
+    sec_root = security_sub.add_parser("download-root")
+    sec_root_sub = sec_root.add_subparsers(dest="security_root_cmd", required=True)
+    sec_root_add = sec_root_sub.add_parser("add")
+    sec_root_add.add_argument("path")
+    sec_root_add.add_argument("--yes", action="store_true")
+    sec_root_add.set_defaults(func=cmd_security_download_root_add)
+    sec_root_remove = sec_root_sub.add_parser("remove")
+    sec_root_remove.add_argument("path")
+    sec_root_remove.set_defaults(func=cmd_security_download_root_remove)
+    sec_perms = security_sub.add_parser("permissions")
+    sec_perms_sub = sec_perms.add_subparsers(dest="security_permissions_cmd", required=True)
+    sec_perms_repair = sec_perms_sub.add_parser("repair")
+    sec_perms_repair.add_argument("--scope", choices=["workspace", "global", "all"], default="workspace")
+    sec_perms_repair.add_argument("--yes", action="store_true")
+    sec_perms_repair.set_defaults(func=cmd_security_permissions_repair)
 
     env = sub.add_parser("env", help="Create, select and inspect the per-project Conda execution environment")
     env_sub = env.add_subparsers(dest="env_cmd", required=True)
@@ -5949,11 +7530,15 @@ def build_parser() -> argparse.ArgumentParser:
     decisions_list = decisions_sub.add_parser("list")
     decisions_list.add_argument("--pending", action="store_true")
     decisions_list.set_defaults(func=cmd_decisions_list)
+    decisions_pending = decisions_sub.add_parser("pending", help="Stable JSON alias for pending decisions")
+    decisions_pending.add_argument("--json", action="store_true")
+    decisions_pending.set_defaults(func=cmd_decisions_list, pending=True)
     decisions_resolve = decisions_sub.add_parser("resolve")
     decisions_resolve.add_argument("decision_id")
     decisions_resolve.add_argument("--option", required=True)
     decisions_resolve.add_argument("--remember", choices=["none", "workspace", "global"], default="none")
     decisions_resolve.add_argument("--note", default="")
+    decisions_resolve.add_argument("--json", action="store_true")
     decisions_resolve.set_defaults(func=cmd_decisions_resolve)
     decisions_checkpoint = decisions_sub.add_parser("checkpoint")
     decisions_checkpoint.add_argument("--stage", default="")

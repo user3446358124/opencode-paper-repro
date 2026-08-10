@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://paper-repro.local/schemas/remote-contract/v1/session-hint.json",
+  "title": "Paper Reproduction Remote Session Hint v1",
+  "type": "object",
+  "required": ["schema_version", "workspace_id", "run_id", "opencode"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "workspace_id": {"type": "string", "pattern": "^ws-[0-9a-f]{12}$"},
+    "run_id": {"type": "string"},
+    "opencode": {
+      "type": "object",
+      "required": ["session_id", "directory", "source", "updated_at", "hint_only"],
+      "properties": {
+        "session_id": {"type": ["string", "null"]},
+        "directory": {"type": "string"},
+        "source": {"type": "string"},
+        "updated_at": {"type": ["string", "null"]},
+        "hint_only": {"const": true}
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

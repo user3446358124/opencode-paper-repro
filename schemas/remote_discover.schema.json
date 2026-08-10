@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://paper-repro.local/schemas/remote-contract/v1/discover.json",
+  "title": "Paper Reproduction Remote Discover v1 Extension",
+  "type": "object",
+  "required": ["schema_version", "generated_at", "cursor_scope", "workspaces"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "generated_at": {"type": "string"},
+    "cursor_scope": {"const": "run"},
+    "workspaces": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["workspace", "workspace_id", "run_id", "status", "active_tasks", "queued_tasks"],
+        "properties": {
+          "workspace": {"type": "string"},
+          "workspace_id": {"type": "string", "pattern": "^ws-[0-9a-f]{12}$"},
+          "run_id": {"type": "string"},
+          "status": {"type": "string"},
+          "stage": {"type": ["string", "null"]},
+          "active_tasks": {"type": "integer", "minimum": 0},
+          "queued_tasks": {"type": "integer", "minimum": 0}
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true
+}

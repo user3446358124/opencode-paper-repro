@@ -1,3 +1,62 @@
+# v2.2.1
+
+- 新增统一安全模块 `scripts/security.py`：项目环境密钥清洗、统一脱敏、symlink 检测。
+- 项目任务默认不继承控制平面 Token/API Key；新增 workspace/task 两级显式 secret allowlist。
+- 新增 bubblewrap 项目执行沙箱；`auto/required` 缺少 bwrap 时 fail-closed，`trusted-off` 必须用户 `--yes`。
+- sandbox 改为最小文件系统可见性：不挂载宿主 `/`，隐藏真实 `.paper-repro` 控制状态，只暴露 cache/任务交换目录、当前 project Conda、必要系统库与显式授权数据根。
+- sandbox 强制 project Conda 与 control Conda 分离；隐藏 Conda sibling env，并保护 `.git/.opencode/opencode.jsonc/AGENTS.md`。
+- GitHub 公开快照递归拒绝任何 symlink，修复嵌套链接越界复制。
+- 安装/卸载增加危险路径与 install marker 校验。
+- 下载器增加 workspace/cache 写入边界和显式 external root 白名单。
+- OpenCode read/plugin 增加 paper-repro、SSH、Git、AWS、GCloud、auth.json 敏感路径阻断，并清空 Bash 子进程中的控制凭据。
+- 新建状态文件默认 user-only 权限；统一 `umask 077`。
+- 新增 `security permissions repair`，可将旧 workspace/global 配置权限迁移到目录 700 / 文件 600。
+- 默认固定 OpenCode、Node.js、GitHub CLI、bubblewrap 与 Python 控制依赖版本；bubblewrap 安装在 control Conda，不使用 sudo/apt。
+- Brave Search MCP 固定为 2.1.0；新增 `dependency-pins.json`，并明确“直接版本固定 ≠ artifact/hash 完全锁定”。
+- 新增 `paper-repro security ...`、`/repro-security` 与 `tests/security_hardening_test.py` CI gate。
+
+# v2.2.0
+
+- 正式冻结 **Remote Contract v1**，双方只依赖 capabilities / snapshot / events / decisions / session hint / command audit。
+- `workspace_id` 改为持久化跨路径身份；旧 v2.1 工作区首次升级时沿用旧路径哈希 ID 后持久化，避免已有 Bridge cursor 失效。
+- 明确 `task_id` 同 run 永不复用；`event_id` 仅在同 run 单调，event-seq 文件丢失时从日志恢复最大序号。
+- `remote decide` 新增稳定 `code`、`resolved_option` / `requested_option`，重复相同选择幂等，冲突返回固定机器码。
+- 远程输出时间统一规范化为 RFC3339 + 显式 timezone offset。
+- GPU assignment 输出 `assignment_source`、`confidence`、`integrity`；task progress 固定 high/medium/low/unknown 真实性等级。
+- Remote command audit 生命周期冻结为 queued/dispatched/accepted/completed/failed/expired/cancelled，并阻止 terminal state 被改写。
+- 新增 Remote Contract v1 Schema、session/discover/decide-response Schema 与强化后的 contract test；CI 将契约测试作为独立 release gate。
+- v2.1 兼容别名 `opencode_session_hint`、snapshot `task_list/gpu` 暂留至 Remote Contract v2 前。
+
+# v2.1.0
+
+- Remote Bridge 契约稳定化：新增 `remote capabilities --json`，客户端按 capability 而不是版本字符串判断功能。
+- `remote snapshot` 对齐业务契约：顶层 pipeline、active/queued/recent task 分组、语义 `gpu_assignments`、blocker/decision 计数、OpenCode session hint。
+- GPU 原始遥测从默认远程快照拆出；Bridge 正常情况下自行采集 `nvidia-smi`，诊断时使用 `--include-telemetry`。
+- 明确 event cursor 为 run-scoped；`remote events` 新增 `run_id/cursor_found/next_cursor/has_more`，Bridge 应保存 `(workspace_id, run_id, event_id)`。
+- `remote decide` 支持幂等：重复相同答案成功返回 `already_resolved`；不同客户端冲突时返回 conflict，不覆盖先前选择。
+- research decision / blocker / stage 更新同步进入 runtime semantic event stream。
+- 新增 OpenCode session/directory hint：`remote session show/bind/clear`，仅作为 Bridge 选会话的提示，不作为权威在线状态。
+- 新增 `remote command record/list`，只记录 Bridge → OpenCode 写操作的脱敏审计元数据；paper-repro 不代理 OpenCode HTTP，也不保存完整 prompt。
+- 新增 Remote Contract JSON Schema 与 `tests/remote_contract_test.py`。
+- 文档明确：OpenCode permission/question/prompt/slash command 继续由 Bridge 直接对接当前运行实例的 OpenAPI/HTTP；paper-repro 不提供 arbitrary remote shell。
+
+# v2.0.0
+
+- **执行内核重构**：长任务从 OpenCode 主会话同步调用改为持久 Task Registry + 独立 Scheduler + Task Worker；`repro_exec` 现在只提交任务并立即返回 `task_id`。
+- 新增每次 run 的 GPU 资源池确认：执行前列出物理 GPU、显存和占用，由用户明确允许调度的 GPU ID；未确认时 GPU 任务只排队不启动。
+- 新增多 GPU 自动调度：独立单卡任务自动并行、任务完成后自动补位；多卡任务显式声明 `gpu_count`、`gpu_ids` 和 `parallel_group_id`。
+- 用户确认的 GPU pool 成为硬边界；任务 affinity 不得扩展到池外 GPU；默认避开检测到的外部繁忙 GPU。
+- 新增 execution plan：experiment-runner 从论文复现矩阵、仓库入口和配置生成完整任务矩阵后一次性提交，调度不再依赖 Agent 持续在线。
+- 新增稳定 Task Registry：`runtime/tasks.json`、`task-specs.json`、`snapshot.json`、`remote-events.jsonl`，任务语义不再由 PID/日志反推。
+- 新增 `paper-repro runtime`、`scheduler`、`gpu` 与 `remote` 命令族；远程端可 `discover → snapshot → events` 增量读取。
+- 新增安全远程状态：默认隐藏命令、cwd 和 Conda prefix；远程控制仅允许 ID 化决策，不提供 arbitrary shell。
+- 新增任务级 progress adapter：native `REPRO_PROGRESS`、tqdm、jsonl/line/file count、regex-log；禁止扫描整个 logs 目录猜当前任务。
+- ETA 明确区分 `timeout_seconds`、`estimate_seconds` 与实时 `eta_seconds`，同时记录来源和置信度。
+- 修复 `decisions --default-option undefined`；未提供默认项时优先 recommended option。
+- 修复 OpenCode Tool 可选参数被序列化为字面量 `undefined` 的问题。
+- OpenCode bash 直接执行 python/pip/torchrun/accelerate/deepspeed/setsid/nohup 默认拒绝，长任务必须走持久执行器。
+- OpenCode 原始调试事件与 paper-repro 语义事件分流；原始事件日志支持滚动，避免长期运行后远程状态读取受大日志拖累。
+
 # v1.0.0
 
 - 新增隐私优先的 GitHub 开源发布闭环，只从安装时保存的系统源码快照生成发布内容。
@@ -17,9 +76,6 @@
 - 公开仓库没有许可证时隐私扫描直接阻断，避免把“可见源码”误当作开源。
 - 扫描当前进程中疑似凭据环境变量，覆盖未写入统一配置的临时 Token。
 - 公开快照新增最小权限 GitHub Actions CI、系统缺陷/功能建议 Issue 表单和 `CONTRIBUTING.md`。
-- 新增运行策略优化：`repro_exec` 默认 `gpus="auto"` 自动选择「显存最少、利用率最低」的空闲卡并设置 `CUDA_VISIBLE_DEVICES`，并避开本 run 中仍在运行的命令已占用的 GPU（commands.jsonl 记录实际分配的 `gpus_index`）；支持 `--gpus 0,1` 显式多卡、`--gpus all/none`；默认值可由 `config.json` 的 `execution_env.gpus_default` 配置（优先级：CLI `gpus` > 配置 > auto）；命令内显式 `CUDA_VISIBLE_DEVICES=...` 时不会被覆盖；日志头、commands.jsonl 和返回 JSON 记录实际 GPU 分配说明。
-- 多卡使用引导写入 experiment-runner 提示词：独立实验分卡并行传不同 `gpus`，torchrun/accelerate/deepspeed 单命令多卡时显式传 `gpus: "0,1"` 并对齐 `nproc_per_node`/`num_processes`。
-- 冒烟测试新增双卡模拟：验证自动选卡、显式选卡、`none` 与命令内显式设置四种场景。
 
 ## v0.9.0
 

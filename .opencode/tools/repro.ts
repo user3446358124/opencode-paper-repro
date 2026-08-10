@@ -4,6 +4,16 @@ function workspaceOf(context: any): string {
   return String(context.worktree || context.directory || process.cwd())
 }
 
+function present(value: any): boolean {
+  if (value === undefined || value === null) return false
+  const text = String(value).trim().toLowerCase()
+  return text !== "" && text !== "undefined" && text !== "null" && text !== "none"
+}
+
+function pushOptional(args: string[], flag: string, value: any) {
+  if (present(value)) args.push(flag, String(value))
+}
+
 async function runCLI(context: any, args: string[]) {
   const workspace = workspaceOf(context)
   const proc = Bun.spawn(["paper-repro", "--workspace", workspace, ...args], {
@@ -34,21 +44,69 @@ export const start = tool({
 })
 
 export const exec = tool({
-  description: "Run a command in the configured project Conda environment with logs, timing, progress and GPU sampling",
+  description: "Submit a project command to the persistent paper-repro scheduler and return immediately with a task_id. Long GPU/CPU jobs must use this instead of OpenCode bash.",
   args: {
-    stage: tool.schema.string().describe("Stable stage name, e.g. install-deps or eval-table-2"),
+    stage: tool.schema.string().describe("Stable stage name, e.g. eval-table-2"),
     command: tool.schema.string(),
-    timeout_seconds: tool.schema.number().int().positive().default(86400),
-    estimate_seconds: tool.schema.number().int().nonnegative().default(0),
-    gpus: tool.schema.string().optional().describe(
-      "GPU 分配策略：auto=自动选择当前显存占用最少的空闲卡并设置 CUDA_VISIBLE_DEVICES（默认，可由 config.json execution_env.gpus_default 覆盖）；all=全部 GPU 可见；none=不设置；或显式列表如 0,1（多卡并行/单命令多卡任务）。命令内已显式设置 CUDA_VISIBLE_DEVICES=... 时不会被覆盖"),
+    gpu_count: tool.schema.number().int().min(0).describe("Required: 0=CPU, 1=single GPU, N=multi-GPU job"),
+    name: tool.schema.string().optional(),
+    gpu_ids: tool.schema.array(tool.schema.number().int().min(0)).optional(),
+    min_free_memory_mb: tool.schema.number().int().min(0).optional(),
+    timeout_seconds: tool.schema.number().int().positive().optional(),
+    estimate_seconds: tool.schema.number().int().nonnegative().optional(),
+    priority: tool.schema.number().int().optional(),
+    dependencies: tool.schema.array(tool.schema.string()).optional(),
+    parallel_group: tool.schema.string().optional(),
+    progress_adapter: tool.schema.object({
+      type: tool.schema.enum(["auto", "native", "tqdm", "jsonl-line-count", "line-count", "file-count", "regex-log"]),
+      path: tool.schema.string().optional(),
+      total: tool.schema.number().optional(),
+      unit: tool.schema.string().optional(),
+      pattern: tool.schema.string().optional(),
+      glob: tool.schema.string().optional(),
+      message: tool.schema.string().optional(),
+    }).optional(),
+    output_paths: tool.schema.array(tool.schema.string()).optional(),
+    secret_env: tool.schema.array(tool.schema.string()).optional().describe("Only variables explicitly authorized by paper-repro security policy may be injected"),
+  },
+  async execute(args, context) {
+    const cliArgs = [
+      "runtime", "submit",
+      "--name", present(args.name) ? String(args.name) : args.stage,
+      "--stage", args.stage,
+      "--command", args.command,
+      "--gpu-count", String(args.gpu_count),
+    ]
+    if (args.gpu_ids && args.gpu_ids.length) cliArgs.push("--gpu-ids", args.gpu_ids.join(","))
+    if (args.min_free_memory_mb !== undefined) cliArgs.push("--min-free-memory-mb", String(args.min_free_memory_mb))
+    if (args.timeout_seconds !== undefined) cliArgs.push("--timeout", String(args.timeout_seconds))
+    if (args.estimate_seconds !== undefined) cliArgs.push("--estimate", String(args.estimate_seconds))
+    if (args.priority !== undefined) cliArgs.push("--priority", String(args.priority))
+    for (const dep of args.dependencies ?? []) cliArgs.push("--depends-on", dep)
+    pushOptional(cliArgs, "--parallel-group", args.parallel_group)
+    if (args.progress_adapter) cliArgs.push("--progress-adapter", JSON.stringify(args.progress_adapter))
+    for (const output of args.output_paths ?? []) cliArgs.push("--output", output)
+    for (const name of args.secret_env ?? []) cliArgs.push("--secret-env", name)
+    return runCLI(context, cliArgs)
+  },
+})
+
+export const cmd = tool({
+  description: "Run a bounded project-environment command synchronously for setup/diagnostics only. Do not use for training, evaluation, large downloads or background jobs; those must use repro_exec/runtime scheduler.",
+  args: {
+    stage: tool.schema.string().default("setup"),
+    command: tool.schema.string(),
+    timeout_seconds: tool.schema.number().int().positive().max(1800).default(600),
+    estimate_seconds: tool.schema.number().int().nonnegative().optional(),
+    secret_env: tool.schema.array(tool.schema.string()).optional(),
   },
   async execute(args, context) {
     const cliArgs = [
       "exec", "--stage", args.stage, "--command", args.command,
-      "--timeout", String(args.timeout_seconds), "--estimate", String(args.estimate_seconds),
+      "--timeout", String(args.timeout_seconds),
     ]
-    if (args.gpus) cliArgs.push("--gpus", args.gpus)
+    if (args.estimate_seconds !== undefined) cliArgs.push("--estimate", String(args.estimate_seconds))
+    for (const name of args.secret_env ?? []) cliArgs.push("--secret-env", name)
     return runCLI(context, cliArgs)
   },
 })
@@ -72,11 +130,98 @@ export const download = tool({
   },
 })
 
+export const security = tool({
+  description: "Inspect paper-repro execution security. Project code is sandboxed and receives no persisted secrets by default.",
+  args: {
+    action: tool.schema.enum(["show"]),
+  },
+  async execute(_args, context) {
+    return runCLI(context, ["security", "show"])
+  },
+})
+
 export const status = tool({
   description: "Return the current run stage, progress, ETA, issue count and latest GPU status",
   args: {},
   async execute(_args, context) {
     return runCLI(context, ["status", "--json"])
+  },
+})
+
+export const runtime = tool({
+  description: "Manage the persistent execution runtime: inspect/confirm GPU pool, save and submit an execution plan, inspect task/GPU state, or cancel/retry tasks. Runtime jobs continue even if the OpenCode agent session is idle.",
+  args: {
+    action: tool.schema.enum(["gpu-prepare", "gpu-inspect", "gpu-configure", "status", "tasks", "task", "plan-save", "plan-show", "plan-submit", "scheduler-status", "scheduler-start", "cancel", "retry", "remote-capabilities", "remote-discover", "remote-snapshot", "remote-decisions"]),
+    gpu_ids: tool.schema.array(tool.schema.number().int().min(0)).optional(),
+    remember_workspace: tool.schema.boolean().optional(),
+    max_parallel: tool.schema.number().int().positive().optional(),
+    allow_external_busy: tool.schema.boolean().optional(),
+    tasks: tool.schema.array(tool.schema.object({
+      task_id: tool.schema.string().optional(),
+      display_name: tool.schema.string(),
+      stage: tool.schema.string().optional(),
+      command: tool.schema.string(),
+      gpu_count: tool.schema.number().int().min(0),
+      gpu_ids: tool.schema.array(tool.schema.number().int().min(0)).optional(),
+      min_free_memory_mb: tool.schema.number().int().min(0).optional(),
+      timeout_seconds: tool.schema.number().int().positive().optional(),
+      estimate_seconds: tool.schema.number().int().nonnegative().optional(),
+      priority: tool.schema.number().int().optional(),
+      dependencies: tool.schema.array(tool.schema.string()).optional(),
+      parallel_group_id: tool.schema.string().optional(),
+      progress_adapter: tool.schema.object({
+        type: tool.schema.enum(["auto", "native", "tqdm", "jsonl-line-count", "line-count", "file-count", "regex-log"]),
+        path: tool.schema.string().optional(),
+        total: tool.schema.number().optional(),
+        unit: tool.schema.string().optional(),
+        pattern: tool.schema.string().optional(),
+        glob: tool.schema.string().optional(),
+        message: tool.schema.string().optional(),
+      }).optional(),
+      output_paths: tool.schema.array(tool.schema.string()).optional(),
+    })).optional(),
+    task_id: tool.schema.string().optional(),
+    include_command: tool.schema.boolean().optional(),
+  },
+  async execute(args, context) {
+    if (args.action === "gpu-prepare") return runCLI(context, ["gpu", "prepare", "--json"])
+    if (args.action === "gpu-inspect") return runCLI(context, ["gpu", "inspect", "--json"])
+    if (args.action === "gpu-configure") {
+      if (!args.gpu_ids) throw new Error("gpu-configure requires gpu_ids; use [] for CPU-only")
+      const cliArgs = ["gpu", "configure", "--ids", args.gpu_ids.length ? args.gpu_ids.join(",") : "none"]
+      if (args.remember_workspace) cliArgs.push("--remember-workspace")
+      if (args.max_parallel !== undefined) cliArgs.push("--max-parallel", String(args.max_parallel))
+      if (args.allow_external_busy) cliArgs.push("--allow-external-busy")
+      return runCLI(context, cliArgs)
+    }
+    if (args.action === "status") return runCLI(context, ["runtime", "status", "--json"])
+    if (args.action === "tasks") return runCLI(context, ["runtime", "tasks", "--json"])
+    if (args.action === "task") {
+      if (!args.task_id) throw new Error("task requires task_id")
+      return runCLI(context, ["runtime", "task", args.task_id, "--json"])
+    }
+    if (args.action === "plan-show") return runCLI(context, ["runtime", "plan", "show"])
+    if (args.action === "plan-save" || args.action === "plan-submit") {
+      if (!args.tasks || !args.tasks.length) throw new Error(`${args.action} requires tasks`)
+      const plan = JSON.stringify({ schema_version: 1, source: "opencode-agent", tasks: args.tasks })
+      const op = args.action === "plan-save" ? "save" : "submit"
+      return runCLI(context, ["runtime", "plan", op, "--tasks-json", plan])
+    }
+    if (args.action === "scheduler-status") return runCLI(context, ["scheduler", "status"])
+    if (args.action === "scheduler-start") return runCLI(context, ["scheduler", "start"])
+    if (args.action === "cancel" || args.action === "retry") {
+      if (!args.task_id) throw new Error(`${args.action} requires task_id`)
+      return runCLI(context, ["runtime", args.action, args.task_id])
+    }
+    if (args.action === "remote-capabilities") return runCLI(context, ["remote", "capabilities", "--json"])
+    if (args.action === "remote-discover") return runCLI(context, ["remote", "discover", "--active", "--json"])
+    if (args.action === "remote-decisions") return runCLI(context, ["remote", "decisions", "--json"])
+    if (args.action === "remote-snapshot") {
+      const cliArgs = ["remote", "snapshot", "--json"]
+      if (args.include_command) cliArgs.push("--include-command")
+      return runCLI(context, cliArgs)
+    }
+    throw new Error(`Unsupported runtime action: ${args.action}`)
   },
 })
 
@@ -212,10 +357,12 @@ export const vision = tool({
     output: tool.schema.string().optional(),
   },
   async execute(args, context) {
-    const cliArgs = ["vision", "analyze", "--task", args.task, "--prompt", args.prompt, "--pages", args.pages, "--dpi", String(args.dpi)]
+    const cliArgs = ["vision", "analyze", "--task", present(args.task) ? String(args.task) : "vision", "--prompt", args.prompt]
+    if (present(args.pages)) cliArgs.push("--pages", String(args.pages))
+    if (args.dpi !== undefined && args.dpi !== null) cliArgs.push("--dpi", String(args.dpi))
     for (const input of args.inputs) cliArgs.push("--input", input)
-    if (args.profile) cliArgs.push("--profile", args.profile)
-    if (args.output) cliArgs.push("--output", args.output)
+    pushOptional(cliArgs, "--profile", args.profile)
+    pushOptional(cliArgs, "--output", args.output)
     return runCLI(context, cliArgs)
   },
 })
@@ -332,11 +479,11 @@ export const decision = tool({
       "--download-gb", String(args.download_gb),
       "--patch-files", String(args.patch_files),
       "--options-json", JSON.stringify(args.options),
-      "--default-option", args.default_option,
-      "--recommended-option", args.recommended_option,
-      "--preference-key", args.preference_key,
-      "--context", args.context,
     ]
+    pushOptional(cliArgs, "--default-option", args.default_option)
+    pushOptional(cliArgs, "--recommended-option", args.recommended_option)
+    pushOptional(cliArgs, "--preference-key", args.preference_key)
+    pushOptional(cliArgs, "--context", args.context)
     if (args.changes_results) cliArgs.push("--changes-results")
     if (args.external_side_effect) cliArgs.push("--external-side-effect")
     return runCLI(context, cliArgs)

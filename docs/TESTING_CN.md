@@ -53,3 +53,15 @@ paper-opencode
 ## 决策层测试
 
 冒烟测试覆盖低风险自动记录、L2 待确认、`repro_exec` 退出码 3、等待决策不进入系统问题、用户确认和 workspace 偏好复用。
+
+
+## Remote Contract v1 发布门禁
+
+```bash
+python tests/remote_contract_test.py
+python tests/runtime_engine_test.py
+```
+
+`remote_contract_test.py` 验证 capabilities、持久 workspace_id、run-scoped event cursor、event sequence 恢复、task ID 不复用、RFC3339 时间、decision 幂等/冲突、session hint、command audit 生命周期/idempotency 和 Schema。
+
+该测试属于 Remote Contract v1 的兼容性门禁；自我迭代流程与 GitHub CI 都必须执行，不能因为普通 smoke test 已通过而跳过。

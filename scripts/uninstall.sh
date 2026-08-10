@@ -10,6 +10,39 @@ OPENCODE_CONFIG_HOME="${OPENCODE_CONFIG_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/
 INSTALL_HOME="${PAPER_REPRO_INSTALL_HOME:-$CONDA_PREFIX/share/opencode-paper-repro}"
 USER_BIN="${PAPER_REPRO_USER_BIN:-$HOME/.local/bin}"
 
+canonical_path() {
+  python - "$1" <<'PY_CANON'
+import os, sys
+print(os.path.realpath(os.path.expanduser(sys.argv[1])))
+PY_CANON
+}
+INSTALL_HOME="$(canonical_path "$INSTALL_HOME")"
+CONDA_PREFIX_REAL="$(canonical_path "$CONDA_PREFIX")"
+HOME_REAL="$(canonical_path "$HOME")"
+case "$INSTALL_HOME" in
+  /|"$HOME_REAL"|"$CONDA_PREFIX_REAL")
+    echo "ERROR: 拒绝危险卸载路径：$INSTALL_HOME" >&2
+    exit 2
+    ;;
+esac
+if [[ ! -f "$INSTALL_HOME/install.json" ]]; then
+  echo "ERROR: $INSTALL_HOME 缺少 paper-repro install.json 标记，拒绝 rm -rf。" >&2
+  exit 2
+fi
+MARKED_HOME="$(python - "$INSTALL_HOME/install.json" <<'PY_MARKER'
+import json, os, sys
+try:
+    data=json.load(open(sys.argv[1], encoding='utf-8'))
+    print(os.path.realpath(data.get('install_home','')))
+except Exception:
+    print('')
+PY_MARKER
+)"
+if [[ "$MARKED_HOME" != "$INSTALL_HOME" ]]; then
+  echo "ERROR: install.json 中的 install_home 与当前路径不一致，拒绝卸载。" >&2
+  exit 2
+fi
+
 rm -f "$CONDA_PREFIX/bin/paper-repro"
 rm -f "$USER_BIN/paper-repro" "$USER_BIN/paper-opencode"
 rm -rf "$INSTALL_HOME"
@@ -32,6 +65,7 @@ for file in \
   "$OPENCODE_CONFIG_HOME/commands/repro-improvements.md" \
   "$OPENCODE_CONFIG_HOME/commands/repro-publish.md" \
   "$OPENCODE_CONFIG_HOME/commands/repro-publications.md" \
+  "$OPENCODE_CONFIG_HOME/commands/repro-security.md" \
   "$OPENCODE_CONFIG_HOME/agents/repro-orchestrator.md" \
   "$OPENCODE_CONFIG_HOME/agents/paper-auditor.md" \
   "$OPENCODE_CONFIG_HOME/agents/repo-mapper.md" \

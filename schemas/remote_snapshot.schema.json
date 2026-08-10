@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://paper-repro.local/schemas/remote-contract/v1/snapshot.json",
+  "title": "Paper Reproduction Remote Snapshot v1",
+  "type": "object",
+  "required": ["schema_version", "generated_at", "workspace", "workspace_id", "run", "pipeline", "tasks", "gpu_assignments", "decisions", "blockers", "opencode", "contract"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "generated_at": {"type": "string"},
+    "workspace": {"type": "string"},
+    "workspace_id": {"type": "string", "pattern": "^ws-[0-9a-f]{12}$"},
+    "run": {
+      "type": "object",
+      "required": ["run_id", "state"],
+      "properties": {
+        "run_id": {"type": ["string", "null"]},
+        "state": {"type": ["string", "null"]},
+        "started_at": {"type": ["string", "null"]},
+        "elapsed_seconds": {"type": ["number", "integer", "null"]},
+        "message": {"type": ["string", "null"]}
+      },
+      "additionalProperties": true
+    },
+    "pipeline": {"type": "object"},
+    "scheduler": {"type": "object"},
+    "queue": {"type": "object"},
+    "tasks": {
+      "type": "object",
+      "required": ["active", "queued", "recent_completed"],
+      "properties": {
+        "active": {"type": "array", "items": {"$ref": "#/$defs/task"}},
+        "queued": {"type": "array", "items": {"$ref": "#/$defs/task"}},
+        "recent_completed": {"type": "array", "items": {"$ref": "#/$defs/task"}}
+      },
+      "additionalProperties": true
+    },
+    "gpu_assignments": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["task_id", "task_ids", "role", "assignment_source", "confidence", "integrity", "updated_at"],
+        "properties": {
+          "task_id": {"type": ["string", "null"]},
+          "task_ids": {"type": "array", "items": {"type": "string"}},
+          "role": {"type": "string"},
+          "assignment_source": {"const": "paper-repro"},
+          "confidence": {"enum": ["high", "medium", "low", "unknown"]},
+          "integrity": {"enum": ["ok", "conflict"]},
+          "updated_at": {"type": "string"}
+        },
+        "additionalProperties": true
+      }
+    },
+    "gpu_telemetry": {"type": "array", "items": {"type": "object"}},
+    "decisions": {"type": "object"},
+    "blockers": {"type": "object"},
+    "system_issues": {"type": "object"},
+    "opencode": {"type": "object"},
+    "privacy": {"enum": ["safe", "full"]},
+    "contract": {
+      "type": "object",
+      "required": ["name", "major", "minor", "status", "event_cursor_scope"],
+      "properties": {
+        "name": {"const": "paper-repro-remote"},
+        "major": {"const": 1},
+        "minor": {"type": "integer", "minimum": 0},
+        "status": {"const": "frozen"},
+        "event_cursor_scope": {"const": "run"}
+      },
+      "additionalProperties": true
+    }
+  },
+  "$defs": {
+    "task": {
+      "type": "object",
+      "required": ["task_id", "state", "progress"],
+      "properties": {
+        "task_id": {"type": "string", "minLength": 1},
+        "state": {"type": "string"},
+        "gpu_ids": {"type": "array", "items": {"type": "integer", "minimum": 0}},
+        "started_at": {"type": ["string", "null"]},
+        "finished_at": {"type": ["string", "null"]},
+        "timeout_seconds": {"type": ["integer", "null"], "minimum": 0},
+        "startup_estimate_seconds": {"type": ["integer", "null"], "minimum": 0},
+        "progress": {
+          "type": "object",
+          "required": ["confidence", "source"],
+          "properties": {
+            "current": {"type": ["number", "null"]},
+            "total": {"type": ["number", "null"]},
+            "percent": {"type": ["number", "null"]},
+            "eta_seconds": {"type": ["integer", "number", "null"]},
+            "estimated_finish_at": {"type": ["string", "null"]},
+            "confidence": {"enum": ["high", "medium", "low", "unknown"]},
+            "source": {"type": "string"},
+            "updated_at": {"type": ["string", "null"]}
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

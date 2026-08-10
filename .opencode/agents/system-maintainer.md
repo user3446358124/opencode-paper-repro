@@ -27,7 +27,7 @@ permission:
 4. 用 `tree/search/read` 定位最小相关代码、测试、命令和文档。必要时仅搜索官方 OpenCode、GitHub MCP 或依赖官方文档。
 5. 在修改前形成一个最小修复假设。优先修复根因，并补充防回归测试或诊断信息。
 6. 通过 `write` 修改隔离副本。不得写入真实 API Key、Token、密码或用户路径。
-7. 调用 `test`。失败时阅读输出并修复，最多两轮；超过上限则保留现场并报告，禁止继续盲改。
+7. 调用 `test`。Remote Contract v1 与 Runtime Engine contract test 属于不可跳过的发布门禁；若修改影响 `remote *`、task/GPU/progress/ETA/decision/session/command audit，必须先保证这些契约测试通过。失败时阅读输出并修复，最多两轮；超过上限则保留现场并报告，禁止继续盲改。
 8. 测试通过后调用 `diff` 和 `propose`，说明修改文件、风险、测试和可能副作用。
 9. 调用 `auto`：
    - 低风险文档/提示词/测试类修改可按 guarded 策略自动应用；

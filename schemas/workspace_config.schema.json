@@ -46,6 +46,85 @@
     },
     "decision_preferences": {
       "type": "object"
+    },
+    "runtime": {
+      "type": "object",
+      "properties": {
+        "default_gpu_ids": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "uniqueItems": true
+        },
+        "max_parallel_tasks": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "confirm_each_run": {
+          "type": "boolean"
+        },
+        "updated_at": {
+          "type": "string"
+        }
+      }
+    },
+    "workspace_id": {
+      "type": "string",
+      "pattern": "^ws-[0-9a-f]{12}$"
+    },
+    "execution_security": {
+      "type": "object",
+      "properties": {
+        "sandbox": {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "enum": [
+                "auto",
+                "required",
+                "trusted-off"
+              ]
+            },
+            "backend": {
+              "enum": [
+                "auto",
+                "bubblewrap"
+              ]
+            },
+            "network": {
+              "enum": [
+                "on",
+                "off"
+              ]
+            }
+          }
+        },
+        "allowed_secret_env": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
+        "allowed_download_roots": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
+        "privacy_mode": {
+          "enum": [
+            "private",
+            "collaborative"
+          ]
+        }
+      }
     }
   }
 }

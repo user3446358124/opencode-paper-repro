@@ -1,6 +1,6 @@
 # OpenCode 论文自动复现系统完整使用说明
 
-**系统版本：1.0.0**  
+**系统版本：2.2.1**  
 **文档版本：1.0**  
 **适用环境：Linux、远程 GPU 服务器、Conda、OpenCode TUI**  
 **主要用途：论文与代码审计、环境构建、实验复现、代码讲解、系统自我迭代，以及隐私安全的 GitHub 开源发布**
@@ -40,7 +40,7 @@
 ## 1.1 新服务器只安装一次
 
 ```bash
-unzip opencode-paper-repro-starter-v1.0.0.zip
+unzip opencode-paper-repro-starter-v2.2.1.zip
 cd opencode-paper-repro-starter
 
 conda create -n paper-repro-control python=3.11 -y
@@ -63,7 +63,7 @@ which paper-repro
 which gh
 ```
 
-`paper-repro --version` 应显示 `1.0.0`。
+`paper-repro --version` 应显示 `2.2.1`。
 
 ## 1.2 配置底座模型
 
@@ -217,11 +217,11 @@ paper-repro status --watch
 例如：
 
 ```text
-工作区：/path/to/project
+工作区：/srv/projects/example-paper
 项目 Conda：lead-repro-py310
 ```
 
-`example-project` 只是目录名。系统不会根据目录名猜测 Conda 环境。
+`mlrm-LEAD` 只是目录名。系统不会根据目录名猜测 Conda 环境。
 
 ## 2.4 系统不自动执行的高风险行为
 
@@ -342,7 +342,7 @@ conda activate paper-repro-control
 解压新版并覆盖：
 
 ```bash
-unzip opencode-paper-repro-starter-v1.0.0.zip
+unzip opencode-paper-repro-starter-v2.2.1.zip
 cd opencode-paper-repro-starter
 
 bash bootstrap.sh
@@ -1012,6 +1012,31 @@ paper-repro status --watch
 
 ---
 
+# 11.5 v2.0 持久执行与 GPU 调度
+
+v2.0 开始，OpenCode 不再同步持有训练/评测长进程。进入实验执行前，系统先列出物理 GPU 并要求确认本次 run 可调度的 GPU 资源池：
+
+```bash
+paper-repro gpu prepare --json
+paper-repro gpu configure --ids 0,1 --max-parallel 2
+```
+
+随后 `experiment-runner` 根据复现矩阵、README 与项目入口生成完整 execution plan，一次性提交到独立 Scheduler。独立单卡任务自动并行并在 GPU 空闲后补位；多卡任务显式声明 `gpu_count`/`parallel_group_id`。OpenCode 会话断开或空闲不会终止 Scheduler。
+
+远程端先做 capability handshake，再读取 run-scoped 状态：
+
+```bash
+paper-repro remote capabilities --json
+paper-repro remote discover --active --json
+paper-repro --latest remote snapshot --json
+paper-repro --latest remote events --after EVT-... --json
+paper-repro --latest remote decisions --json
+```
+
+从 v2.2 正式冻结 Remote Contract v1；事件 cursor 明确为 **run-scoped**：Remote Bridge 应保存 `(workspace_id, run_id, event_id)`，新 run 或 `cursor_found=false` 时重置 cursor。OpenCode permission/question/prompt/slash command 仍由 Bridge 直连 OpenCode HTTP，paper-repro 不代理。
+
+详见 [`docs/EXECUTION_RUNTIME_V2_CN.md`](docs/EXECUTION_RUNTIME_V2_CN.md)、[`docs/REMOTE_RUNTIME_API_CN.md`](docs/REMOTE_RUNTIME_API_CN.md) 和 [`docs/REMOTE_BRIDGE_REVIEW_2.1_CN.md`](docs/REMOTE_BRIDGE_REVIEW_2.1_CN.md)。
+
 # 12. 实时进度、下载、GPU 与日志
 
 ## 12.1 中文状态页
@@ -1557,6 +1582,7 @@ paper-repro publish configure --after-verified prepare
 | `/repro-status` | 中文状态摘要 |
 | `/repro-resume` | 从当前检查点继续 |
 | `/repro-env` | 查看或配置项目 Conda |
+| `/repro-security` | 查看执行沙箱、任务密钥和下载写入边界 |
 | `/repro-models` | 查看模型能力路由 |
 | `/repro-paper` | 查看 PDF 文本/视觉策略 |
 | `/repro-explain` | 生成代码阅读手册 |
@@ -1576,6 +1602,12 @@ paper-repro publish configure --after-verified prepare
 paper-repro env show
 paper-repro env create --name ENV --python 3.10
 paper-repro env use --name ENV
+
+paper-repro security show
+paper-repro security sandbox set --mode trusted-off --yes
+paper-repro security permissions repair --scope workspace --yes   # 仅可信仓库
+paper-repro security secret allow HF_TOKEN --yes
+paper-repro security download-root add /data/paper-assets --yes
 
 paper-repro models show
 paper-repro models native --capability auto
@@ -1868,7 +1900,7 @@ paper-repro publish push PUB-...
 ### 安装
 
 - [ ] 控制环境不是 `base`；
-- [ ] `paper-repro --version` 为 `1.0.0`；
+- [ ] `paper-repro --version` 为 `2.2.1`；
 - [ ] `paper-opencode`、`paper-repro`、`gh` 可用；
 - [ ] OpenCode 权限模板已合并；
 - [ ] `/reproduce` 和 `/repro-publish` 可见。
@@ -1897,3 +1929,8 @@ paper-repro publish push PUB-...
 - [ ] Token 未出现在聊天、命令行或日志；
 - [ ] 已有仓库默认使用 Pull Request；
 - [ ] 公共仓库包含明确许可证。
+
+
+## v2.2.1 安全加固补充
+
+项目执行、密钥隔离、bubblewrap 沙箱、发布 symlink fail-closed、安装/卸载路径保护与固定依赖详见 `docs/SECURITY_HARDENING_2.2.1_CN.md`。

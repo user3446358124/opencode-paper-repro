@@ -12,7 +12,10 @@ if [[ "${CONDA_DEFAULT_ENV:-}" == "base" ]]; then
   exit 2
 fi
 
-OPENCODE_VERSION="${OPENCODE_VERSION:-latest}"
+OPENCODE_VERSION="${OPENCODE_VERSION:-1.18.4}"
+NODEJS_SPEC="${PAPER_REPRO_NODEJS_SPEC:-nodejs=26.5.0}"
+GH_SPEC="${PAPER_REPRO_GH_SPEC:-gh=2.96.0}"
+BWRAP_SPEC="${PAPER_REPRO_BWRAP_SPEC:-bubblewrap=0.11.2}"
 PYTHON="${PYTHON:-python}"
 INSTALL_HOME="${PAPER_REPRO_INSTALL_HOME:-$CONDA_PREFIX/share/opencode-paper-repro}"
 OPENCODE_CONFIG_HOME="${OPENCODE_CONFIG_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/opencode}"
@@ -25,13 +28,34 @@ MCP_RUNTIME_CONFIG="$PAPER_REPRO_CONFIG_HOME/opencode.mcp.runtime.json"
 CONFIG_FILE="${PAPER_REPRO_CONFIG_FILE:-$PAPER_REPRO_CONFIG_HOME/config.json}"
 SECRETS_FILE="$CONFIG_FILE"
 
+canonical_path() {
+  "$PYTHON" - "$1" <<'PY_CANON'
+import os, sys
+print(os.path.realpath(os.path.expanduser(sys.argv[1])))
+PY_CANON
+}
+INSTALL_HOME="$(canonical_path "$INSTALL_HOME")"
+CONDA_PREFIX_REAL="$(canonical_path "$CONDA_PREFIX")"
+HOME_REAL="$(canonical_path "$HOME")"
+case "$INSTALL_HOME" in
+  /|"$HOME_REAL"|"$CONDA_PREFIX_REAL")
+    echo "ERROR: 拒绝危险 PAPER_REPRO_INSTALL_HOME=$INSTALL_HOME" >&2
+    exit 2
+    ;;
+esac
+SAFE_PREFIX="$CONDA_PREFIX_REAL/share/"
+if [[ "$INSTALL_HOME/" != "$SAFE_PREFIX"* && "${PAPER_REPRO_ALLOW_EXTERNAL_INSTALL_HOME:-0}" != "1" ]]; then
+  echo "ERROR: 自定义安装目录必须位于 $CONDA_PREFIX_REAL/share/ 下。若确有需要，显式设置 PAPER_REPRO_ALLOW_EXTERNAL_INSTALL_HOME=1。" >&2
+  exit 2
+fi
+
 mkdir -p "$INSTALL_HOME" "$CONDA_PREFIX/bin"
 
 if [[ "$SKIP_DEPENDENCIES" != "1" ]]; then
   # 强制 Node.js 来自当前 Conda 环境，避免复现控制层依赖宿主机 Node。
   NODE_PATH="$(command -v node 2>/dev/null || true)"
   if [[ -z "$NODE_PATH" || "$(readlink -f "$NODE_PATH")" != "$CONDA_PREFIX/bin/node" ]]; then
-    conda install -y -c conda-forge nodejs
+    conda install -y -c conda-forge "$NODEJS_SPEC"
     hash -r
   fi
 
@@ -40,13 +64,21 @@ if [[ "$SKIP_DEPENDENCIES" != "1" ]]; then
   # GitHub CLI is installed in the control Conda for privacy-gated publication.
   GH_PATH="$(command -v gh 2>/dev/null || true)"
   if [[ -z "$GH_PATH" || "$(readlink -f "$GH_PATH")" != "$CONDA_PREFIX/bin/gh" ]]; then
-    conda install -y -c conda-forge gh
+    conda install -y -c conda-forge "$GH_SPEC"
+    hash -r
+  fi
+
+  # bubblewrap lives in the control Conda so project sandboxing does not require
+  # sudo/apt or any system-wide package mutation. Kernel user-namespace policy is
+  # still checked at execution time; failures remain fail-closed.
+  BWRAP_PATH="$(command -v bwrap 2>/dev/null || true)"
+  if [[ -z "$BWRAP_PATH" || "$(readlink -f "$BWRAP_PATH")" != "$CONDA_PREFIX/bin/bwrap" ]]; then
+    conda install -y -c conda-forge "$BWRAP_SPEC"
     hash -r
   fi
 
   "$PYTHON" -m pip install --upgrade pip
-  "$PYTHON" -m pip install \
-    pymupdf pypdf huggingface_hub rich psutil pyyaml requests tqdm pandas packaging
+  "$PYTHON" -m pip install -r "$SYSTEM_HOME/configs/control-requirements.lock.txt"
 else
   echo "跳过 Node.js、OpenCode 和 Python 依赖安装，仅更新控制器与全局扩展。"
 fi
@@ -54,10 +86,9 @@ fi
 # 将控制器安装到 Conda 环境。项目目录移动后，paper-repro 命令仍然有效。
 rm -rf "$INSTALL_HOME/scripts" "$INSTALL_HOME/schemas" "$INSTALL_HOME/docs" "$INSTALL_HOME/configs" "$INSTALL_HOME/opencode-profile" "$INSTALL_HOME/source"
 mkdir -p "$INSTALL_HOME/scripts" "$INSTALL_HOME/schemas" "$INSTALL_HOME/docs" "$INSTALL_HOME/configs" "$INSTALL_HOME/opencode-profile" "$INSTALL_HOME/source"
-# Install the whole scripts/ directory: helper modules imported by
-# reproctl.py (e.g. gpu_policy.py) must be installed as well.
-# The CLI entry runs via python, so no executable bit is required.
-cp -a "$SYSTEM_HOME/scripts/." "$INSTALL_HOME/scripts/"
+install -m 755 "$SYSTEM_HOME/scripts/reproctl.py" "$INSTALL_HOME/scripts/reproctl.py"
+install -m 644 "$SYSTEM_HOME/scripts/runtime_engine.py" "$INSTALL_HOME/scripts/runtime_engine.py"
+install -m 644 "$SYSTEM_HOME/scripts/security.py" "$INSTALL_HOME/scripts/security.py"
 install -m 644 "$SYSTEM_HOME/VERSION" "$INSTALL_HOME/VERSION"
 cp -a "$SYSTEM_HOME/schemas/." "$INSTALL_HOME/schemas/"
 cp -a "$SYSTEM_HOME/docs/." "$INSTALL_HOME/docs/"
@@ -195,6 +226,12 @@ cat > "$INSTALL_HOME/install.json" <<JSON
   "source_snapshot": "$INSTALL_HOME/source",
   "self_improvement_enabled": true,
   "github_publication_enabled": true,
+  "persistent_execution_runtime": true,
+  "remote_runtime_contract": true,
+  "remote_contract_name": "paper-repro-remote",
+  "remote_contract_major": 1,
+  "remote_contract_status": "frozen",
+  "gpu_scheduler": true,
   "conda_prefix": "$CONDA_PREFIX",
   "conda_env": "${CONDA_DEFAULT_ENV:-unknown}",
   "conda_executable": "$CONDA_EXE_PATH",
@@ -202,6 +239,16 @@ cat > "$INSTALL_HOME/install.json" <<JSON
   "node": "$(command -v node)",
   "opencode": "$(command -v opencode)",
   "opencode_version": "$(opencode --version 2>/dev/null || true)",
+  "opencode_version_pinned": "$OPENCODE_VERSION",
+  "nodejs_spec": "$NODEJS_SPEC",
+  "github_cli_spec": "$GH_SPEC",
+  "bubblewrap_spec": "$BWRAP_SPEC",
+  "bubblewrap": "$(command -v bwrap 2>/dev/null || true)",
+  "bubblewrap_version": "$(bwrap --version 2>/dev/null || true)",
+  "python_dependency_lock": "$INSTALL_HOME/configs/control-requirements.lock.txt",
+  "dependency_pin_manifest": "$INSTALL_HOME/configs/dependency-pins.json",
+  "dependency_pin_level": "direct-version-pinned",
+  "brave_search_mcp_version": "2.1.0",
   "github_cli": "$(command -v gh 2>/dev/null || true)",
   "github_cli_version": "$(gh --version 2>/dev/null | head -1 || true)",
   "global_opencode_config": "$OPENCODE_CONFIG_HOME",
@@ -232,6 +279,11 @@ if [[ "$GLOBAL_INSTALL" == "1" ]]; then
   echo "建议从目标目录执行 paper-opencode，而不是在项目环境中重复安装 OpenCode。"
 else
   echo "未安装全局扩展。请设置 OPENCODE_CONFIG_DIR=$INSTALL_HOME/opencode-profile 后启动 OpenCode。"
+fi
+if command -v bwrap >/dev/null 2>&1; then
+  echo "执行沙箱：bubblewrap 已检测到；新项目默认 fail-closed 沙箱可用。"
+else
+  echo "WARNING: 未检测到 bwrap（bubblewrap）。为保护统一密钥和用户 Home，新项目长/短项目命令将默认 fail-closed；请安装 bubblewrap，或仅对已审查可信仓库显式执行：paper-repro security sandbox set --mode trusted-off --yes"
 fi
 echo "建议先运行：paper-repro doctor"
 echo "模型路由：paper-repro models show（系统不预设或硬编码底座/视觉模型）"

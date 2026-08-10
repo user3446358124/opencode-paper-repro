@@ -18,9 +18,11 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      - name: Install locked control/test dependencies
+        run: python -m pip install -r configs/control-requirements.lock.txt
       - name: Validate Python and shell syntax
         run: |
-          python -m py_compile scripts/reproctl.py
+          python -m py_compile scripts/security.py scripts/runtime_engine.py scripts/reproctl.py
           bash -n bootstrap.sh scripts/uninstall.sh tests/smoke_test.sh
       - name: Validate JSON schemas and examples
         run: |
@@ -31,6 +33,12 @@ jobs:
               json.loads(path.read_text(encoding='utf-8'))
               print(f'OK {path}')
           PY
+      - name: Run Remote Contract v1 gate
+        run: python tests/remote_contract_test.py
+      - name: Run runtime engine test
+        run: python tests/runtime_engine_test.py
+      - name: Run security hardening gate
+        run: python tests/security_hardening_test.py
       - name: Run isolated smoke test
         env:
           PAPER_REPRO_SELF_TEST: '1'

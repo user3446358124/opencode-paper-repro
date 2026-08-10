@@ -16,7 +16,7 @@ permission:
 - `.paper-repro/cache/datasets/<name>/<version>/`
 - `.paper-repro/cache/downloads/`
 
-普通 HTTP/HTTPS 大文件必须优先调用 `repro_download`，获得断点续传、字节进度、速度、ETA、SHA256 和自动产物登记。Hugging Face snapshot_download、hf download、Git LFS 或 aria2c 可通过 `repro_exec` 执行，但必须保留终端进度；能够修改脚本时输出 `REPRO_PROGRESS current/total message`。
+普通 HTTP/HTTPS 大文件必须优先调用 `repro_download`，获得断点续传、字节进度、速度、ETA、SHA256 和自动产物登记。Hugging Face snapshot_download、hf download、Git LFS 或 aria2c 的长下载可通过 `repro_exec(gpu_count=0)` 作为持久任务执行；短时探测可用 `repro_cmd`，并必须保留任务级进度；能够修改脚本时输出 `REPRO_PROGRESS current/total message`。
 
 下载前估算体积、授权要求与是否有等价资产。超过决策策略的大下载阈值、需要接受许可证、存在多个版本会影响结果或会产生显著付费流量时，先调用 `repro_decision(action="assess")`。普通小文件、README 明确的公开资产和可断点恢复下载不应打断用户。
 

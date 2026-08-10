@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://paper-repro.local/schemas/remote-contract/v1/decisions.json",
+  "title": "Paper Reproduction Remote Decisions v1",
+  "type": "object",
+  "required": ["schema_version", "workspace_id", "run_id", "decisions"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "workspace_id": {"type": "string", "pattern": "^ws-[0-9a-f]{12}$"},
+    "run_id": {"type": "string"},
+    "decisions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["decision_id", "run_id", "level", "title", "question", "options", "allow_custom_answer", "allow_remember", "blocking", "state"],
+        "properties": {
+          "decision_id": {"type": "string", "minLength": 1},
+          "run_id": {"type": "string"},
+          "task_id": {"type": ["string", "null"]},
+          "level": {"type": ["integer", "number", "null"]},
+          "stage": {"type": ["string", "null"]},
+          "category": {"type": ["string", "null"]},
+          "title": {"type": ["string", "null"]},
+          "question": {"type": ["string", "null"]},
+          "options": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["id", "label", "recommended"],
+              "properties": {
+                "id": {"type": "string", "minLength": 1},
+                "label": {"type": "string"},
+                "consequence": {"type": "string"},
+                "recommended": {"type": "boolean"}
+              },
+              "additionalProperties": true
+            }
+          },
+          "allow_custom_answer": {"type": "boolean"},
+          "allow_remember": {"type": "boolean"},
+          "blocking": {"type": "boolean"},
+          "state": {"type": "string"},
+          "created_at": {"type": ["string", "null"]},
+          "resolved_at": {"type": ["string", "null"]},
+          "selected_option": {"type": ["string", "null"]}
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true
+}

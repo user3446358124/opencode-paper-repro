@@ -43,31 +43,11 @@ exit 2
 SCRIPT
 chmod +x "$FAKE_BIN/conda"
 
-# Fake dual-GPU host: GPU 0 uses less memory than GPU 1, so auto-selection must pick GPU 0.
-cat > "$FAKE_BIN/nvidia-smi" <<'SMIMOCK'
-#!/usr/bin/env bash
-if [[ "${1:-}" == "-q" ]]; then
-  echo "fake nvidia-smi"
-  exit 0
-fi
-cat <<'CSV'
-0, NVIDIA A100-PCIE-40GB, GPU-00000000-0000-0000-0000-000000000000, 0, 1024, 40960, 28, 35
-1, NVIDIA A100-PCIE-40GB, GPU-00000000-0000-0000-0000-000000000001, 0, 2048, 40960, 28, 36
-CSV
-SMIMOCK
-chmod +x "$FAKE_BIN/nvidia-smi"
-
 export PATH="$FAKE_BIN:$PATH"
 export CONDA_PREFIX="$CONTROL"
 export CONDA_DEFAULT_ENV="paper-repro-control-test"
 export XDG_STATE_HOME="$TMP/global-state"
 export TERM="${TERM:-xterm}"
-# Isolate this test from any outer OpenCode workspace injection: repro_* tools set
-# REPRO_WORKSPACE, which would otherwise redirect init/env/exec into the caller's
-# real workspace and corrupt its config.json.
-unset REPRO_WORKSPACE REPRO_STATE_HOME REPRO_RUN_DIR CONDA_EXE PAPER_REPRO_CONDA_EXE \
-  PAPER_REPRO_MCP_CONFIG PAPER_REPRO_MODEL_ROUTING PAPER_REPRO_SECRETS_FILE \
-  PAPER_REPRO_SOURCE_HOME PAPER_REPRO_INSTALL_HOME 2>/dev/null || true
 
 PROJECT="$TMP/project"
 mkdir -p "$PROJECT/subdir"
@@ -97,33 +77,18 @@ git commit -qm smoke
 
 python "$ROOT/scripts/reproctl.py" init --repository smoke --paper smoke.pdf >/dev/null
 python "$ROOT/scripts/reproctl.py" env use --prefix "$PROJECT_ENV" >/dev/null
+# The smoke fixture is local code created by this test. In CI environments without
+# bubblewrap, explicitly mark this synthetic repository trusted instead of weakening
+# the production default (which remains fail-closed).
+python "$ROOT/scripts/reproctl.py" security sandbox set --mode trusted-off --yes >/dev/null
 python "$ROOT/scripts/reproctl.py" stage --stage paper-audit --status running --step 1 --step-total 8 --step-status running >/dev/null
 
 cd "$PROJECT/subdir"
 python "$ROOT/scripts/reproctl.py" status --json | grep -q '"run_id"'
 python "$ROOT/scripts/reproctl.py" exec --stage smoke --command \
-  'python -c "import os; print(os.environ.get(\"SMOKE_PROJECT_PREFIX\")); print(\"CUDA_VISIBLE_DEVICES=\" + str(os.environ.get(\"CUDA_VISIBLE_DEVICES\"))); print(\"REPRO_PROGRESS 1/1 done\")"' \
+  'python -c "import os; print(os.environ.get(\"SMOKE_PROJECT_PREFIX\")); print(\"REPRO_PROGRESS 1/1 done\")"' \
   --timeout 30 > "$TMP/exec.out"
 grep -q "$PROJECT_ENV" "$TMP/exec.out"
-grep -q 'CUDA_VISIBLE_DEVICES=0' "$TMP/exec.out"
-
-# Explicit GPU selection: --gpus 1 must pin CUDA_VISIBLE_DEVICES=1 on the second card.
-python "$ROOT/scripts/reproctl.py" exec --stage smoke-gpus-1 --command \
-  'python -c "import os; print(\"CUDA_VISIBLE_DEVICES=\" + str(os.environ.get(\"CUDA_VISIBLE_DEVICES\")))"' \
-  --gpus 1 --timeout 30 > "$TMP/exec-gpus1.out"
-grep -q 'CUDA_VISIBLE_DEVICES=1' "$TMP/exec-gpus1.out"
-
-# --gpus none must leave CUDA_VISIBLE_DEVICES unset.
-python "$ROOT/scripts/reproctl.py" exec --stage smoke-gpus-none --command \
-  'python -c "import os; print(\"CUDA_VISIBLE_DEVICES=\" + str(os.environ.get(\"CUDA_VISIBLE_DEVICES\")))"' \
-  --gpus none --timeout 30 > "$TMP/exec-gpus-none.out"
-grep -q 'CUDA_VISIBLE_DEVICES=None' "$TMP/exec-gpus-none.out"
-
-# A command that sets CUDA_VISIBLE_DEVICES itself must not be overridden.
-python "$ROOT/scripts/reproctl.py" exec --stage smoke-gpus-explicit --command \
-  'CUDA_VISIBLE_DEVICES=1 python -c "import os; print(\"CUDA_VISIBLE_DEVICES=\" + str(os.environ.get(\"CUDA_VISIBLE_DEVICES\")))"' \
-  --timeout 30 > "$TMP/exec-gpus-explicit.out"
-grep -q 'CUDA_VISIBLE_DEVICES=1' "$TMP/exec-gpus-explicit.out"
 
 python "$ROOT/scripts/reproctl.py" stage --stage paper-audit --status completed --step 1 --step-total 8 --step-status completed >/dev/null
 python "$ROOT/scripts/reproctl.py" status --json > "$TMP/status.json"
@@ -162,6 +127,52 @@ set -e
 grep -q 'WAITING_FOR_DECISION' "$TMP/decision.err"
 ! grep -q 'blocked-by-decision' "$PROJECT/.paper-repro/system/SYSTEM_ISSUES.md"
 python "$ROOT/scripts/reproctl.py" decisions resolve "$DECISION_ID" --option main --remember workspace --note 'smoke' >/dev/null
+python "$ROOT/scripts/reproctl.py" remote capabilities --json > "$TMP/remote-capabilities.json"
+python - "$TMP/remote-capabilities.json" <<'PY'
+import json, sys
+data=json.load(open(sys.argv[1], encoding='utf-8'))
+assert data['capabilities']['snapshot'] == 1
+assert data['cursor_scope'] == 'run'
+assert data['remote_write_policy']['arbitrary_shell'] is False
+PY
+python "$ROOT/scripts/reproctl.py" remote decide "$DECISION_ID" main --json > "$TMP/remote-idempotent.json"
+python - "$TMP/remote-idempotent.json" <<'PY'
+import json, sys
+data=json.load(open(sys.argv[1], encoding='utf-8'))
+assert data['ok'] is True
+assert data['state'] == 'already_resolved'
+assert data['selected'] == 'main'
+PY
+python "$ROOT/scripts/reproctl.py" remote session bind --session-id ses_smoke --directory "$PROJECT" --json >/dev/null
+python "$ROOT/scripts/reproctl.py" remote snapshot --json > "$TMP/remote-snapshot.json"
+python - "$TMP/remote-snapshot.json" "$PROJECT" <<'PY'
+import json, sys
+data=json.load(open(sys.argv[1], encoding='utf-8'))
+assert data['schema_version'] == 1
+assert data['workspace'] == sys.argv[2]
+assert data['workspace_id'].startswith('ws-')
+assert set(data['tasks']) == {'active','queued','recent_completed'}
+assert data['opencode']['session_id'] == 'ses_smoke'
+assert 'gpu_telemetry' not in data
+PY
+python "$ROOT/scripts/reproctl.py" remote events --after EVT-999999999999 --json > "$TMP/remote-events-missing.json"
+python - "$TMP/remote-events-missing.json" <<'PY'
+import json, sys
+data=json.load(open(sys.argv[1], encoding='utf-8'))
+assert data['cursor_scope'] == 'run'
+assert data['cursor_found'] is False
+assert data['events'] == []
+PY
+python "$ROOT/scripts/reproctl.py" remote command record --request-id RCMD-smoke --target opencode --type prompt --state queued --requires-idle --idempotency-key idem-smoke --summary 'safe smoke command' --json >/dev/null
+python "$ROOT/scripts/reproctl.py" remote command record --request-id RCMD-smoke --target opencode --type prompt --state accepted --requires-idle --idempotency-key idem-smoke --summary 'safe smoke command' --json >/dev/null
+python "$ROOT/scripts/reproctl.py" remote command list --json > "$TMP/remote-command-list.json"
+python - "$TMP/remote-command-list.json" <<'PY'
+import json, sys
+data=json.load(open(sys.argv[1], encoding='utf-8'))
+item=next(x for x in data['commands'] if x['request_id']=='RCMD-smoke')
+assert item['state']=='accepted'
+assert item['idempotency_key']=='idem-smoke'
+PY
 python "$ROOT/scripts/reproctl.py" decisions assess \
   --title '再次选择实验覆盖范围' --question '沿用已确认的实验范围？' \
   --category experiment-scope --stage execution --impact high --reversibility reversible --confidence 0.9 --changes-results \
@@ -226,9 +237,6 @@ grep -q '项目复现阻塞项' "$TMP/status.zh.txt"
 
 export PAPER_REPRO_CONFIG_HOME="$TMP/paper-repro-config"
 export PAPER_REPRO_CONFIG_FILE="$PAPER_REPRO_CONFIG_HOME/config.json"
-# Drop caller-injected secret environment variables so the persisted-value
-# assertions below are deterministic (apply_persistent_secrets never overwrites).
-unset PAPER_VISION_API_KEY CONTEXT7_API_KEY GITHUB_MCP_TOKEN GITHUB_TOKEN HF_TOKEN HUGGING_FACE_HUB_TOKEN BRAVE_API_KEY BRAVE_API_KEY_FILE GITHUB_PUBLISH_TOKEN 2>/dev/null || true
 python "$ROOT/scripts/reproctl.py" secrets init --quiet
 printf 'smoke-vision-token' | python "$ROOT/scripts/reproctl.py" secrets set PAPER_VISION_API_KEY --stdin >/dev/null
 python "$ROOT/scripts/reproctl.py" secrets exec -- python -c 'import os; assert os.environ["PAPER_VISION_API_KEY"] == "smoke-vision-token"'
@@ -377,3 +385,4 @@ PYPUSH
 fi
 
 echo "smoke test passed"
+

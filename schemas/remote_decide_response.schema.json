@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://paper-repro.local/schemas/remote-contract/v1/decide-response.json",
+  "title": "Paper Reproduction Remote Decide Response v1",
+  "type": "object",
+  "required": ["ok", "code", "decision_id", "workspace_id", "run_id", "state"],
+  "properties": {
+    "ok": {"type": "boolean"},
+    "code": {"enum": ["resolved", "already_resolved", "decision_not_found", "invalid_option"]},
+    "decision_id": {"type": "string"},
+    "workspace_id": {"type": "string", "pattern": "^ws-[0-9a-f]{12}$"},
+    "run_id": {"type": "string"},
+    "state": {"enum": ["resolved", "already_resolved", "not_found", "invalid_option"]},
+    "resolved_option": {"type": ["string", "null"]},
+    "requested_option": {"type": ["string", "null"]},
+    "resolved_at": {"type": ["string", "null"]},
+    "conflict": {"type": "boolean"},
+    "remaining_pending": {"type": "integer", "minimum": 0},
+    "allowed_options": {"type": "array", "items": {"type": "string"}}
+  },
+  "additionalProperties": true
+}

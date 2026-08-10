@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "release": "2.2.1",
+  "opencode_ai": "1.18.4",
+  "nodejs_conda": "26.5.0",
+  "github_cli_conda": "2.96.0",
+  "brave_search_mcp": "2.1.0",
+  "python_requirements": "control-requirements.lock.txt",
+  "pin_level": "direct-version-pinned",
+  "artifact_hash_lock": false,
+  "notes": [
+    "Direct control-plane dependencies are version-pinned by default.",
+    "Python transitive dependencies and remote MCP services are not artifact-hash locked.",
+    "A full cross-platform wheel/npm artifact lock is intentionally not claimed by this release."
+  ],
+  "bubblewrap_conda": "0.11.2"
+}
